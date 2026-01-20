@@ -1,0 +1,65 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.dnstt.client'
+    compileSdk 34
+
+    defaultConfig {
+        applicationId "com.dnstt.client"
+        minSdk 24
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    // Split APKs by ABI to reduce size
+    // Each APK will only contain native libs for one architecture
+    splits {
+        abi {
+            enable true
+            reset()
+            include "armeabi-v7a", "arm64-v8a", "x86", "x86_64"
+            universalApk true  // Also generate a universal APK with all ABIs
+        }
+    }
+
+    // Assign different version codes to each ABI variant
+    // This ensures each APK has a unique version code for Play Store
+    project.ext.abiCodes = ['armeabi-v7a': 1, 'arm64-v8a': 2, 'x86': 3, 'x86_64': 4]
+    applicationVariants.all { variant ->
+        variant.outputs.each { output ->
+            def abiFilter = output.getFilter(com.android.build.OutputFile.ABI)
+            def abiCode = project.ext.abiCodes.get(abiFilter)
+            if (abiCode != null) {
+                output.versionCodeOverride = abiCode * 1000 + variant.versionCode
+            }
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    sourceSets {
+        main {
+            jniLibs.srcDirs = ['libs', 'src/main/jniLibs']
+        }
+    }
+}
+
+dependencies {
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    implementation fileTree(dir: 'libs', include: ['*.aar'])
+}

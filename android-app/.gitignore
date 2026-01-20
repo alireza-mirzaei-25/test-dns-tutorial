@@ -1,0 +1,21 @@
+# Gradle
+.gradle/
+build/
+local.properties
+
+# Android SDK
+cmdline-tools.zip
+
+# APK outputs
+*.apk
+*.aab
+
+# IDE
+.idea/
+*.iml
+
+# Go mobile bindings (generated)
+app/libs/*.aar
+
+# NDK build artifacts
+app/src/main/obj/
