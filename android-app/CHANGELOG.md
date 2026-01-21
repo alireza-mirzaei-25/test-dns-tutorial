@@ -2,6 +2,83 @@
 
 All notable changes to the DNSTT VPN Client Android app will be documented in this file.
 
+## [1.3.0] - 2025-01-21
+
+### Added
+
+- **DNS Configuration Auto-Update:** Auto DNS label now updates immediately when returning from DNS configuration
+  - Added `reloadCustomLists()` method to DnsConfigManager
+  - Configuration changes reflect instantly in main screen
+  - DNS count updates in real-time
+
+- **Enhanced Connection Logging:** Prominent DNS IP logging during connection
+  - Shows which DNS server is being used with bordered log messages
+  - Appears when DNS is selected and when connection establishes
+  - Format: `====================================`
+           `✓ USING DNS: 1.1.1.1`
+           `====================================`
+
+- **Comprehensive Tunnel Cleanup:** Complete cleanup on disconnect and app close
+  - Enhanced `disconnect()` method with detailed step-by-step logging
+  - Enhanced `onDestroy()` with complete tunnel termination
+  - Stops all DNS test executors
+  - Stops all search threads
+  - Properly terminates SOCKS client or VPN service
+  - Clears all references to prevent memory leaks
+
+### Improved
+
+- **DNS Card Button Layout:** Complete redesign for better usability
+  - All four buttons (Edit, Delete, Test, Select) now fit on ONE horizontal line
+  - Reduced button text size from 16sp to 12sp for better fit
+  - Added `textAllCaps="false"` for improved readability
+  - Even weight distribution across all buttons (layout_weight="1")
+  - 4dp margins between buttons for clean spacing
+  - Edit/Delete buttons hidden by default (`visibility="gone"`)
+
+- **DNS Test Latency Display:** Fixed race condition for accurate latency reporting
+  - Implemented CountDownLatch synchronization in GlobalDnsFragment
+  - Test button now displays actual measured latency (e.g., "45ms" instead of "0ms")
+  - Waits up to 6 seconds for callback completion before updating UI
+  - Proper error handling with "Connection timeout or no latency data" message
+
+### Fixed
+
+- **Button Layout Overflow:**
+  - Fixed two-row button layout that caused buttons to wrap
+  - Consolidated into single horizontal LinearLayout
+  - All buttons now fit properly on all screen sizes
+
+- **Latency Race Condition:**
+  - Fixed asynchronous callback timing issue in DNS testing
+  - Added CountDownLatch to wait for callback completion
+  - Result array properly populated before UI update
+  - Fixed condition check from `result[0] > 0 ? result[0] : 0` to direct assignment
+
+- **Auto DNS Label Sync:**
+  - Fixed stale DNS count display after configuration changes
+  - Added explicit reload mechanism when returning from ConfigurationActivity
+  - SharedPreferences properly reloaded before UI update
+
+- **Connection State Management:**
+  - Improved disconnect logic with proper state cleanup
+  - Added logging for each cleanup step
+  - Ensures all tunnels stop when VPN disconnects or app closes
+
+### Technical Details
+
+**Modified Files:**
+- `DnsConfigManager.java` - Added `reloadCustomLists()` public method (lines 111-113)
+- `MainActivity.java` - Enhanced logging, disconnect, and configuration callback (lines 163, 801-803, 965-1017, 1125-1130, 1336-1399)
+- `item_dns_config.xml` - Single-row button layout (lines 96-150)
+- `GlobalDnsFragment.java` - CountDownLatch synchronization (lines 22-23, 106, 119, 132-149)
+
+**Key Improvements:**
+- Synchronous callback handling prevents race conditions
+- Immediate UI feedback for configuration changes
+- Clear visual indicators for DNS selection
+- Robust cleanup prevents zombie connections
+
 ## [1.2.0] - 2025-01-21
 
 ### Added

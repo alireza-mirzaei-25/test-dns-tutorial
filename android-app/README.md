@@ -2,6 +2,29 @@
 
 Android app for dnstt DNS tunnel client.
 
+## Features
+
+### DNS Management
+- **Global DNS Library:** Access to 3,956+ public DNS servers
+- **Custom DNS Lists:** Create and manage your own DNS server lists
+- **DNS Import:** Import DNS servers from text files
+- **Auto DNS:** Automatically find and connect to working DNS servers
+- **Parallel Testing:** Test multiple DNS servers simultaneously (1-10 threads)
+- **DNS Prioritization:** Previously successful DNS servers automatically prioritized
+- **Real-time Testing:** Test DNS server latency with accurate measurements
+- **One-Line Button Layout:** Clean, compact UI with all actions on a single row
+
+### Connection Features
+- **Smart Retry:** "It doesn't work" button to quickly switch to alternative DNS
+- **Enhanced Logging:** Clear visual indicators showing which DNS is being used
+- **Robust Cleanup:** Complete tunnel cleanup on disconnect and app close
+- **Auto-Update Labels:** Configuration changes reflect immediately in UI
+
+### Performance
+- **Parallel DNS Testing:** 5x faster DNS discovery with configurable thread pool
+- **Accurate Latency Reporting:** Fixed race conditions for precise measurements
+- **Memory Optimized:** Proper cleanup prevents memory leaks and zombie connections
+
 ## Prerequisites
 
 - Go 1.21+
@@ -89,3 +112,16 @@ ndk-build
 ```bash
 cp -r ../libs/* ../jniLibs/
 ```
+
+## Version Information
+
+**Current Version:** 1.3.0 (Build 4)
+
+### Recent Updates (v1.3.0)
+- Improved DNS card button layout (all buttons on one line)
+- Fixed DNS test latency display accuracy
+- Enhanced connection logging with clear DNS IP indicators
+- Auto-updating configuration labels
+- Comprehensive cleanup on disconnect and app close
+
+See [CHANGELOG.md](CHANGELOG.md) for complete version history.
