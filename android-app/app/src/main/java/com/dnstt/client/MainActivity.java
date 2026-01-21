@@ -159,8 +159,14 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         configActivityLauncher = registerForActivityResult(
                 new ActivityResultContracts.StartActivityForResult(),
                 result -> {
+                    // Reload custom lists from storage to get latest changes
+                    dnsConfigManager.reloadCustomLists();
+
                     // Refresh dropdown (user might have added/deleted custom lists)
                     setupDnsSourceDropdown();
+
+                    // Update Auto DNS label to reflect any changes in DNS count
+                    updateAutoDnsLabel();
 
                     if (result.getResultCode() == RESULT_OK && result.getData() != null) {
                         String selectedDns = result.getData().getStringExtra("selected_dns");
@@ -792,7 +798,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                     currentConnectedDns = workingResolver;
                     dnsConfigManager.saveLastSuccessfulDns(workingResolver);
 
-                    appendLog("Using resolver: " + workingResolver);
+                    appendLog("====================================");
+                    appendLog("✓ USING DNS: " + workingResolver);
+                    appendLog("====================================");
                     transportAddr.setText(workingResolver);
                     connectButton.setText(R.string.disconnect);
 
@@ -836,7 +844,12 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
             return;
         }
 
-        appendLog("Retrying with different DNS (excluding " + currentConnectedDns + ")");
+        appendLog("Moving " + currentConnectedDns + " to end of list");
+
+        // Move current DNS to the end of the list
+        dnsConfigManager.moveDnsToEnd(currentConnectedDns);
+
+        appendLog("Retrying with different DNS from reordered list");
 
         // Disconnect current VPN
         disconnect();
@@ -849,16 +862,16 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                 numTunnels = Integer.parseInt(getText(tunnels));
             } catch (NumberFormatException ignored) {}
 
-            // Get resolvers excluding current one
-            String resolvers = dnsConfigManager.getDnsServersForAutoSearchWithPriority(currentConnectedDns);
+            // Get resolvers with new order (failed DNS now at the end)
+            String resolvers = dnsConfigManager.getDnsServersForAutoSearchWithPriority(null);
 
             if (resolvers == null || resolvers.trim().isEmpty()) {
-                appendLog("ERROR: No alternative DNS servers available");
-                Toast.makeText(this, "No alternative DNS servers available", Toast.LENGTH_SHORT).show();
+                appendLog("ERROR: No DNS servers available");
+                Toast.makeText(this, "No DNS servers available", Toast.LENGTH_SHORT).show();
                 return;
             }
 
-            appendLog("Searching for alternative DNS server...");
+            appendLog("Searching from top of reordered list...");
             testAndConnectWithBestResolver(dom, numTunnels);
         }, 1500);
     }
@@ -950,7 +963,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     }
 
     private void disconnect() {
-        appendLog("Disconnecting...");
+        appendLog("====================================");
+        appendLog("Disconnecting and stopping all tunnels...");
+        appendLog("====================================");
         connectButton.setEnabled(false);  // Prevent double-clicks
         connectButton.setText("Stopping...");
 
@@ -961,27 +976,33 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
         // Force shutdown any remaining DNS test executor
         if (dnsTestExecutor != null) {
-            appendLog("Force stopping DNS tests...");
+            appendLog("Stopping parallel DNS tests...");
             dnsTestExecutor.shutdownNow();
             dnsTestExecutor = null;
         }
 
         // Interrupt any search threads
         if (searchThread != null && searchThread.isAlive()) {
+            appendLog("Stopping DNS search thread...");
             searchThread.interrupt();
             searchThread = null;
         }
 
         if (vpnMode) {
             // Stop VPN service
+            appendLog("Stopping VPN service and all tunnels...");
             Intent intent = new Intent(this, DnsttVpnService.class);
             intent.setAction(DnsttVpnService.ACTION_STOP);
             startForegroundService(intent);
         } else {
+            appendLog("Stopping SOCKS proxy and all tunnels...");
             new Thread(() -> {
                 try {
                     if (client != null) {
+                        appendLog("Stopping DNSTT client...");
                         client.stop();
+                        appendLog("DNSTT client stopped");
+                        client = null;
                     }
                 } catch (Exception e) {
                     handler.post(() -> appendLog("Error stopping client: " + e.getMessage()));
@@ -989,6 +1010,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                 handler.post(() -> {
                     connectButton.setEnabled(true);
                     setInputsEnabled(true);
+                    appendLog("All tunnels stopped");
                 });
             }, "DisconnectThread").start();
         }
@@ -1106,6 +1128,17 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                         if (statusCircle != null) statusCircle.setBackgroundResource(R.drawable.status_circle_connected);
                         if (connectButton != null) connectButton.setText(R.string.disconnect);
                         isConnected = true;
+
+                        // Log connected DNS prominently
+                        if (currentConnectedDns != null) {
+                            appendLog("====================================");
+                            appendLog("✓ CONNECTED TO DNS: " + currentConnectedDns);
+                            if (currentLatencyMs > 0) {
+                                appendLog("  Latency: " + currentLatencyMs + "ms");
+                            }
+                            appendLog("====================================");
+                        }
+
                         // Show stats card
                         if (statsCard != null) statsCard.setVisibility(View.VISIBLE);
                         // Show retry button when connected (only if using auto DNS)
@@ -1304,6 +1337,8 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     protected void onDestroy() {
         super.onDestroy();
 
+        appendLog("App closing - cleaning up all resources...");
+
         // Cancel any ongoing search
         if (isSearching) {
             cancelSearch = true;
@@ -1315,8 +1350,32 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
         // Shutdown DNS test executor
         if (dnsTestExecutor != null) {
+            appendLog("Shutting down DNS test executor...");
             dnsTestExecutor.shutdownNow();
             dnsTestExecutor = null;
+        }
+
+        // Stop client if connected in non-VPN mode
+        if (!vpnMode && client != null) {
+            try {
+                appendLog("Stopping SOCKS client on app close...");
+                client.stop();
+                appendLog("SOCKS client stopped");
+            } catch (Exception e) {
+                appendLog("Error stopping client on destroy: " + e.getMessage());
+            }
+        }
+
+        // For VPN mode, ensure service is stopped
+        if (vpnMode && isConnected) {
+            try {
+                appendLog("Stopping VPN service on app close...");
+                Intent intent = new Intent(this, DnsttVpnService.class);
+                intent.setAction(DnsttVpnService.ACTION_STOP);
+                startService(intent);
+            } catch (Exception e) {
+                appendLog("Error stopping VPN on destroy: " + e.getMessage());
+            }
         }
 
         // Remove UI callback to prevent memory leak
@@ -1328,15 +1387,6 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
             appUpdater = null;
         }
 
-        // Stop client if connected in non-VPN mode
-        if (!vpnMode && isConnected && client != null) {
-            try {
-                client.stop();
-            } catch (Exception e) {
-                // Ignore errors during cleanup
-            }
-        }
-
         // Remove all handler callbacks to prevent memory leaks
         if (handler != null) {
             handler.removeCallbacksAndMessages(null);
@@ -1344,6 +1394,8 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
         // Clear references
         client = null;
+
+        appendLog("App cleanup completed");
     }
 
     private void checkForUpdates() {

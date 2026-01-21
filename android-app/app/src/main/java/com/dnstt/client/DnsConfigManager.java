@@ -106,6 +106,13 @@ public class DnsConfigManager {
     }
 
     /**
+     * Reload custom DNS lists from storage (call when lists may have been modified externally)
+     */
+    public void reloadCustomLists() {
+        loadCustomLists();
+    }
+
+    /**
      * Save custom DNS lists to storage
      */
     private void saveCustomLists() {
@@ -296,14 +303,94 @@ public class DnsConfigManager {
     }
 
     /**
+     * Get list of deprioritized DNS servers (those that failed)
+     */
+    public java.util.Set<String> getDeprioritizedDns() {
+        String deprioritized = prefs.getString("deprioritized_dns", "");
+        java.util.Set<String> set = new java.util.HashSet<>();
+        if (!deprioritized.isEmpty()) {
+            for (String dns : deprioritized.split(",")) {
+                if (!dns.trim().isEmpty()) {
+                    set.add(dns.trim());
+                }
+            }
+        }
+        return set;
+    }
+
+    /**
+     * Add a DNS to the deprioritized list (move to end)
+     */
+    public void moveDnsToEnd(String address) {
+        if (address == null || address.isEmpty()) {
+            return;
+        }
+
+        java.util.Set<String> deprioritized = getDeprioritizedDns();
+        deprioritized.add(address);
+
+        // Save back to preferences
+        StringBuilder sb = new StringBuilder();
+        for (String dns : deprioritized) {
+            if (sb.length() > 0) sb.append(",");
+            sb.append(dns);
+        }
+        prefs.edit().putString("deprioritized_dns", sb.toString()).apply();
+
+        // For custom lists, actually reorder the list
+        if (SOURCE_CUSTOM.equals(getSelectedSource())) {
+            String listId = getSelectedListId();
+            if (listId != null) {
+                CustomDnsList list = getCustomList(listId);
+                if (list != null) {
+                    List<DnsConfig> configs = list.getDnsConfigs();
+                    DnsConfig toMove = null;
+
+                    // Find the DNS config to move
+                    for (DnsConfig config : configs) {
+                        String configAddress = config.getAddress();
+                        // Extract IP without port for comparison
+                        if (configAddress.contains(":")) {
+                            configAddress = configAddress.substring(0, configAddress.indexOf(":"));
+                        }
+                        if (configAddress.equals(address)) {
+                            toMove = config;
+                            break;
+                        }
+                    }
+
+                    // Move to end if found
+                    if (toMove != null) {
+                        configs.remove(toMove);
+                        configs.add(toMove);
+                        list.setDnsConfigs(configs);
+                        updateCustomList(list);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Clear deprioritized DNS list (reset to default order)
+     */
+    public void clearDeprioritizedDns() {
+        prefs.edit().remove("deprioritized_dns").apply();
+    }
+
+    /**
      * Get DNS servers with last successful one first, optionally excluding an address
+     * Deprioritized servers are moved to the end
      */
     public String getDnsServersForAutoSearchWithPriority(String excludeAddress) {
         String lastSuccessful = getLastSuccessfulDns();
+        java.util.Set<String> deprioritized = getDeprioritizedDns();
         StringBuilder sb = new StringBuilder();
+        List<String> deprioritizedServers = new ArrayList<>();
 
-        // Add last successful DNS first (if it exists and is not excluded)
+        // Add last successful DNS first (if it exists and is not excluded and not deprioritized)
         if (lastSuccessful != null && !lastSuccessful.isEmpty() &&
+            !deprioritized.contains(lastSuccessful) &&
             (excludeAddress == null || !lastSuccessful.equals(excludeAddress))) {
             sb.append(lastSuccessful).append("\n");
         }
@@ -311,7 +398,7 @@ public class DnsConfigManager {
         // Get all DNS servers
         String allServers = getDnsServersForAutoSearch();
 
-        // Add remaining servers (excluding last successful and excluded address)
+        // Separate normal and deprioritized servers
         if (allServers != null && !allServers.isEmpty()) {
             String[] servers = allServers.split("\n");
             for (String server : servers) {
@@ -319,9 +406,21 @@ public class DnsConfigManager {
                 if (!server.isEmpty() &&
                     (lastSuccessful == null || !server.equals(lastSuccessful)) &&
                     (excludeAddress == null || !server.equals(excludeAddress))) {
-                    sb.append(server).append("\n");
+
+                    if (deprioritized.contains(server)) {
+                        // Add to deprioritized list (will be added at the end)
+                        deprioritizedServers.add(server);
+                    } else {
+                        // Add to normal priority
+                        sb.append(server).append("\n");
+                    }
                 }
             }
+        }
+
+        // Add deprioritized servers at the end
+        for (String server : deprioritizedServers) {
+            sb.append(server).append("\n");
         }
 
         return sb.toString();
