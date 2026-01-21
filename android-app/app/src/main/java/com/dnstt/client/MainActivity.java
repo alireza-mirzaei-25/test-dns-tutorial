@@ -18,6 +18,12 @@ import android.widget.Toast;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -50,6 +56,11 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     private boolean autoConnect = false;
     private boolean useAutoDns = true;  // Auto DNS: test and select best resolver
     private boolean hasAutoConnected = false;
+
+    // Performance settings
+    private int parallelThreads = 5;  // Number of parallel DNS tests (1-10)
+    private int dnsTimeout = 3000;  // DNS test timeout in milliseconds (500-10000)
+    private String currentConnectedDns = null;  // Track current connected DNS for retry
 
     private DnsServerManager dnsServerManager;
     private Thread searchThread = null;
@@ -100,6 +111,11 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     private TextView autoDnsLabel;
     private AutoCompleteTextView dnsSourceDropdown;
     private MaterialButton btnConfigureDns;
+    private MaterialButton retryButton;
+    private TextInputEditText parallelThreadsInput;
+    private TextInputEditText dnsTimeoutInput;
+    private View parallelThreadsLayout;
+    private View dnsTimeoutLayout;
 
     // App updater
     private AppUpdater appUpdater;
@@ -227,6 +243,11 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         autoDnsLabel = findViewById(R.id.autoDnsLabel);
         dnsSourceDropdown = findViewById(R.id.dnsSourceDropdown);
         btnConfigureDns = findViewById(R.id.btnConfigureDns);
+        retryButton = findViewById(R.id.retryButton);
+        parallelThreadsInput = findViewById(R.id.parallelThreadsInput);
+        dnsTimeoutInput = findViewById(R.id.dnsTimeoutInput);
+        parallelThreadsLayout = findViewById(R.id.parallelThreadsLayout);
+        dnsTimeoutLayout = findViewById(R.id.dnsTimeoutLayout);
 
         // Set version text
         versionText.setText("v" + appUpdater.getCurrentVersion());
@@ -239,6 +260,60 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
             Intent intent = new Intent(this, ConfigurationActivity.class);
             configActivityLauncher.launch(intent);
         });
+
+        // Setup retry button - initially hidden
+        if (retryButton != null) {
+            retryButton.setVisibility(View.GONE);
+            retryButton.setOnClickListener(v -> retryWithDifferentDns());
+        }
+
+        // Setup parallel threads input with validation
+        if (parallelThreadsInput != null) {
+            parallelThreadsInput.addTextChangedListener(new android.text.TextWatcher() {
+                @Override
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+                @Override
+                public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+                @Override
+                public void afterTextChanged(android.text.Editable s) {
+                    try {
+                        int threads = Integer.parseInt(s.toString());
+                        if (threads < 1) threads = 1;
+                        if (threads > 10) threads = 10;
+                        parallelThreads = threads;
+                        saveSettings();
+                    } catch (NumberFormatException e) {
+                        parallelThreads = 5; // default
+                    }
+                }
+            });
+        }
+
+        // Setup DNS timeout input with validation
+        if (dnsTimeoutInput != null) {
+            dnsTimeoutInput.addTextChangedListener(new android.text.TextWatcher() {
+                @Override
+                public void beforeTextChanged(CharSequence s, int start, int count, int after) {}
+
+                @Override
+                public void onTextChanged(CharSequence s, int start, int before, int count) {}
+
+                @Override
+                public void afterTextChanged(android.text.Editable s) {
+                    try {
+                        int timeout = Integer.parseInt(s.toString());
+                        if (timeout < 500) timeout = 500;
+                        if (timeout > 10000) timeout = 10000;
+                        dnsTimeout = timeout;
+                        saveSettings();
+                    } catch (NumberFormatException e) {
+                        dnsTimeout = 3000; // default
+                    }
+                }
+            });
+        }
 
         // Setup update button
         updateButton.setOnClickListener(v -> checkForUpdates());
@@ -561,8 +636,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
             return;
         }
 
-        // Get resolvers from selected DNS source (DnsConfigManager or DnsServerManager)
-        String resolvers = dnsConfigManager.getDnsServersForAutoSearch();
+        // Get resolvers with prioritization (last successful first, no exclusions)
+        String resolvers = dnsConfigManager.getDnsServersForAutoSearchWithPriority(null);
+
         // Count resolvers
         int totalResolvers = resolvers.split("\n").length;
         if (totalResolvers == 0) {
@@ -584,129 +660,181 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         statusText.setTextColor(getColor(R.color.connecting));
         statusCircle.setBackgroundResource(R.drawable.status_circle_connecting);
 
-        searchThread = new Thread(() -> {
-            final long searchStartTime = System.currentTimeMillis();
+        appendLog("Testing " + totalResolvers + " resolvers with " + parallelThreads + " parallel threads");
 
-            handler.post(() -> appendLog("Finding first working resolver from " + totalResolvers + " candidates... (timeout: " + (SEARCH_TIMEOUT_MS / 1000) + "s)"));
+        String[] resolverArray = resolvers.split("\n");
+        ExecutorService executor = Executors.newFixedThreadPool(parallelThreads);
+        AtomicReference<String> foundResolver = new AtomicReference<>(null);
+        AtomicInteger testedCount = new AtomicInteger(0);
+        CountDownLatch latch = new CountDownLatch(1);
 
-            // Create resolver callback for progress updates
-            ResolverCallback callback = new ResolverCallback() {
-                @Override
-                public void onProgress(long tested, long total, String currentResolver) {
-                    if (cancelSearch || (System.currentTimeMillis() - searchStartTime) > SEARCH_TIMEOUT_MS) {
-                        return;
-                    }
-                    handler.post(() -> {
-                        if (!cancelSearch && isSearching) {
-                            statusText.setText("Testing: " + tested + "/" + total);
-                        }
-                    });
+        final long searchStartTime = System.currentTimeMillis();
+
+        // Submit all resolvers to executor
+        for (String resolver : resolverArray) {
+            if (resolver.trim().isEmpty()) continue;
+
+            executor.submit(() -> {
+                if (foundResolver.get() != null || cancelSearch) {
+                    return; // Already found or cancelled
                 }
 
-                @Override
-                public void onResult(String resolver, boolean success, long latencyMs, String errorMsg) {
-                    if (cancelSearch || (System.currentTimeMillis() - searchStartTime) > SEARCH_TIMEOUT_MS) {
-                        return;
-                    }
-                    if (success) {
-                        handler.post(() -> {
-                            if (!cancelSearch && isSearching) {
-                                appendLog("FOUND: " + resolver + " (" + latencyMs + "ms)");
-                                // Store latency for display
-                                currentLatencyMs = latencyMs;
-                                latencyText.setText(latencyMs + " ms");
-                            }
-                        });
-                    } else {
-                        // Only log failures occasionally to avoid spam
-                        handler.post(() -> {
-                            if (!cancelSearch && isSearching) {
-                                appendLog("Skip: " + resolver);
-                            }
-                        });
-                    }
-                }
-            };
+                int tested = testedCount.incrementAndGet();
+                handler.post(() -> statusText.setText("Testing: " + tested + "/" + totalResolvers));
 
-            // Find first working resolver (sequential, stops on first success)
-            // This is fast because it stops as soon as it finds a working resolver
-            String workingResolver = null;
-            try {
-                workingResolver = Mobile.findFirstWorkingResolver(
-                        resolvers,
+                // Test this resolver
+                final String[] result = {null};
+                final long[] latency = {0};
+                CountDownLatch testLatch = new CountDownLatch(1);
+
+                try {
+                    Mobile.findFirstWorkingResolver(
+                        resolver.trim() + "\n",
                         dom,
                         pubkeyHex,
-                        3000,  // 3 second timeout per resolver
-                        callback
-                );
-            } catch (Exception e) {
-                handler.post(() -> appendLog("Search error: " + e.getMessage()));
-            }
+                        dnsTimeout, // Use configurable timeout
+                        new ResolverCallback() {
+                            @Override
+                            public void onProgress(long tested, long total, String currentResolver) {
+                                // Not used for single resolver
+                            }
 
-            // Check for timeout
-            final long searchDuration = System.currentTimeMillis() - searchStartTime;
-            final boolean timedOut = searchDuration > SEARCH_TIMEOUT_MS;
-            final String finalResolver = workingResolver;
+                            @Override
+                            public void onResult(String res, boolean success, long latencyMs, String errorMsg) {
+                                if (success) {
+                                    result[0] = res;
+                                    latency[0] = latencyMs;
+                                }
+                                testLatch.countDown();
+                            }
+                        }
+                    );
 
-            handler.post(() -> {
-                isSearching = false;
+                    testLatch.await(dnsTimeout + 1000, TimeUnit.MILLISECONDS);
 
-                if (cancelSearch) {
-                    appendLog("DNS search cancelled by user");
-                    connectButton.setText(R.string.connect);
-                    statusText.setText(R.string.status_disconnected);
-                    statusText.setTextColor(getColor(R.color.disconnected));
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
-                    setInputsEnabled(true);
-                    cancelSearch = false;
-                    return;
-                }
+                    if (result[0] != null && foundResolver.compareAndSet(null, result[0])) {
+                        // This thread found the first working resolver!
+                        final String foundDns = result[0];
+                        final long foundLatency = latency[0];
 
-                if (timedOut) {
-                    appendLog("ERROR: DNS search timed out after " + (searchDuration / 1000) + " seconds");
-                    appendLog("Try switching to DoH or DoT transport");
-                    connectButton.setText(R.string.connect);
-                    statusText.setText(R.string.status_disconnected);
-                    statusText.setTextColor(getColor(R.color.disconnected));
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
-                    setInputsEnabled(true);
-                    return;
-                }
+                        handler.post(() -> {
+                            appendLog("FOUND: " + foundDns + " (" + foundLatency + "ms)");
+                            currentLatencyMs = foundLatency;
+                            latencyText.setText(foundLatency + " ms");
+                        });
 
-                if (finalResolver == null || finalResolver.isEmpty()) {
-                    appendLog("ERROR: No working resolver found!");
-                    appendLog("Try switching to DoH or DoT transport");
-                    connectButton.setText(R.string.connect);
-                    statusText.setText(R.string.status_disconnected);
-                    statusText.setTextColor(getColor(R.color.disconnected));
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
-                    setInputsEnabled(true);
-                    return;
-                }
-
-                appendLog("Using resolver: " + finalResolver);
-                transportAddr.setText(finalResolver);
-                connectButton.setText(R.string.disconnect);
-
-                // Now connect with the working resolver
-                appendLog("Connecting via " + finalResolver);
-
-                if (vpnMode) {
-                    appendLog("Requesting VPN permission...");
-                    Intent vpnIntent = VpnService.prepare(MainActivity.this);
-                    if (vpnIntent != null) {
-                        vpnPermissionLauncher.launch(vpnIntent);
-                    } else {
-                        appendLog("VPN permission already granted");
-                        startVpnService();
+                        latch.countDown();
                     }
-                } else {
-                    appendLog("Starting SOCKS5 proxy mode...");
-                    connectSocksProxy();
+                } catch (Exception e) {
+                    // Test failed, continue
                 }
             });
-        }, "DNSSearchThread");
-        searchThread.start();
+        }
+
+        // Wait for first result or timeout in background thread
+        new Thread(() -> {
+            try {
+                boolean found = latch.await(SEARCH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+                executor.shutdownNow(); // Stop all threads
+
+                final String workingResolver = foundResolver.get();
+                final long searchDuration = System.currentTimeMillis() - searchStartTime;
+
+                handler.post(() -> {
+                    isSearching = false;
+
+                    if (cancelSearch) {
+                        appendLog("DNS search cancelled by user");
+                        connectButton.setText(R.string.connect);
+                        statusText.setText(R.string.status_disconnected);
+                        statusText.setTextColor(getColor(R.color.disconnected));
+                        statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                        setInputsEnabled(true);
+                        cancelSearch = false;
+                        return;
+                    }
+
+                    if (workingResolver == null || workingResolver.isEmpty()) {
+                        appendLog("ERROR: No working resolver found after " + (searchDuration / 1000) + " seconds");
+                        appendLog("Try switching to DoH or DoT transport");
+                        connectButton.setText(R.string.connect);
+                        statusText.setText(R.string.status_disconnected);
+                        statusText.setTextColor(getColor(R.color.disconnected));
+                        statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                        setInputsEnabled(true);
+                        return;
+                    }
+
+                    // Save successful DNS for future prioritization
+                    currentConnectedDns = workingResolver;
+                    dnsConfigManager.saveLastSuccessfulDns(workingResolver);
+
+                    appendLog("Using resolver: " + workingResolver);
+                    transportAddr.setText(workingResolver);
+                    connectButton.setText(R.string.disconnect);
+
+                    // Now connect with the working resolver
+                    appendLog("Connecting via " + workingResolver);
+
+                    if (vpnMode) {
+                        appendLog("Requesting VPN permission...");
+                        Intent vpnIntent = VpnService.prepare(MainActivity.this);
+                        if (vpnIntent != null) {
+                            vpnPermissionLauncher.launch(vpnIntent);
+                        } else {
+                            appendLog("VPN permission already granted");
+                            startVpnService();
+                        }
+                    } else {
+                        appendLog("Starting SOCKS5 proxy mode...");
+                        connectSocksProxy();
+                    }
+                });
+            } catch (InterruptedException e) {
+                executor.shutdownNow();
+                handler.post(() -> {
+                    isSearching = false;
+                    appendLog("ERROR: Search interrupted");
+                    connectButton.setText(R.string.connect);
+                    statusText.setText(R.string.status_disconnected);
+                    statusText.setTextColor(getColor(R.color.disconnected));
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                    setInputsEnabled(true);
+                });
+            }
+        }, "ParallelDNSSearchThread").start();
+    }
+
+    private void retryWithDifferentDns() {
+        if (!isConnected || currentConnectedDns == null) {
+            return;
+        }
+
+        appendLog("Retrying with different DNS (excluding " + currentConnectedDns + ")");
+
+        // Disconnect current VPN
+        disconnect();
+
+        // Wait for disconnect to complete, then search for new DNS
+        handler.postDelayed(() -> {
+            String dom = getText(domain);
+            int numTunnels = 8;
+            try {
+                numTunnels = Integer.parseInt(getText(tunnels));
+            } catch (NumberFormatException ignored) {}
+
+            // Get resolvers excluding current one
+            String resolvers = dnsConfigManager.getDnsServersForAutoSearchWithPriority(currentConnectedDns);
+
+            if (resolvers == null || resolvers.trim().isEmpty()) {
+                appendLog("ERROR: No alternative DNS servers available");
+                Toast.makeText(this, "No alternative DNS servers available", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            appendLog("Searching for alternative DNS server...");
+            testAndConnectWithBestResolver(dom, numTunnels);
+        }, 1500);
     }
 
     private void cancelDnsSearch() {
@@ -910,6 +1038,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                         if (qualityText != null) qualityText.setText("--");
                         if (latencyText != null) latencyText.setText("-- ms");
                         if (speedText != null) speedText.setText("-- KB/s");
+                        // Hide retry button when disconnected
+                        if (retryButton != null) retryButton.setVisibility(View.GONE);
+                        currentConnectedDns = null;
                         lastBytesIn = 0;
                         lastBytesOut = 0;
                         lastUpdateTime = 0;
@@ -931,6 +1062,8 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                         isConnected = true;
                         // Show stats card
                         if (statsCard != null) statsCard.setVisibility(View.VISIBLE);
+                        // Show retry button when connected (only if using auto DNS)
+                        if (retryButton != null && useAutoDns) retryButton.setVisibility(View.VISIBLE);
                         break;
                     case 3: // Error
                         if (statusText != null) statusText.setText("Error");
@@ -941,6 +1074,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                         if (connectButton != null) connectButton.setEnabled(true);
                         isConnected = false;
                         setInputsEnabled(true);
+                        // Hide retry button on error
+                        if (retryButton != null) retryButton.setVisibility(View.GONE);
+                        currentConnectedDns = null;
                         break;
                 }
             } catch (Exception e) {
@@ -1066,6 +1202,8 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                 .putBoolean("vpnMode", vpnMode)
                 .putBoolean("autoConnect", autoConnect)
                 .putBoolean("useAutoDns", useAutoDns)
+                .putInt("parallelThreads", parallelThreads)
+                .putInt("dnsTimeout", dnsTimeout)
                 .apply();
     }
 
@@ -1093,6 +1231,18 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         useAutoDns = prefs.getBoolean("useAutoDns", true);
         autoDnsSwitch.setChecked(useAutoDns);
         updateAutoDnsLabel();
+
+        // Load performance settings
+        parallelThreads = prefs.getInt("parallelThreads", 5);
+        dnsTimeout = prefs.getInt("dnsTimeout", 3000);
+
+        // Set UI values for performance settings
+        if (parallelThreadsInput != null) {
+            parallelThreadsInput.setText(String.valueOf(parallelThreads));
+        }
+        if (dnsTimeoutInput != null) {
+            dnsTimeoutInput.setText(String.valueOf(dnsTimeout));
+        }
 
         // Update visibility based on transport type
         updateDohProviderVisibility();

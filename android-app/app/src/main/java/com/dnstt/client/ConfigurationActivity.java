@@ -48,14 +48,8 @@ public class ConfigurationActivity extends AppCompatActivity {
         viewPager.setAdapter(adapter);
 
         new TabLayoutMediator(tabLayout, viewPager, (tab, position) -> {
-            switch (position) {
-                case 0:
-                    tab.setText("Global DNS");
-                    break;
-                case 1:
-                    tab.setText("Custom");
-                    break;
-            }
+            // Only one tab: Custom DNS
+            tab.setText("Custom DNS");
         }).attach();
     }
 
@@ -67,19 +61,14 @@ public class ConfigurationActivity extends AppCompatActivity {
         @NonNull
         @Override
         public Fragment createFragment(int position) {
-            switch (position) {
-                case 0:
-                    return new GlobalDnsFragment();
-                case 1:
-                    return new CustomDnsFragment();
-                default:
-                    return new GlobalDnsFragment();
-            }
+            // Only show Custom DNS fragment
+            // Global DNS still accessible via dropdown in MainActivity
+            return new CustomDnsFragment();
         }
 
         @Override
         public int getItemCount() {
-            return 2;
+            return 1; // Only Custom DNS tab
         }
     }
 }

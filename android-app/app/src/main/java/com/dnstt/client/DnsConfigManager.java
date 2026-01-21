@@ -280,4 +280,50 @@ public class DnsConfigManager {
             return "Custom List";
         }
     }
+
+    /**
+     * Save last successful DNS server for prioritization
+     */
+    public void saveLastSuccessfulDns(String address) {
+        prefs.edit().putString("last_successful_dns", address).apply();
+    }
+
+    /**
+     * Get last successful DNS server
+     */
+    public String getLastSuccessfulDns() {
+        return prefs.getString("last_successful_dns", null);
+    }
+
+    /**
+     * Get DNS servers with last successful one first, optionally excluding an address
+     */
+    public String getDnsServersForAutoSearchWithPriority(String excludeAddress) {
+        String lastSuccessful = getLastSuccessfulDns();
+        StringBuilder sb = new StringBuilder();
+
+        // Add last successful DNS first (if it exists and is not excluded)
+        if (lastSuccessful != null && !lastSuccessful.isEmpty() &&
+            (excludeAddress == null || !lastSuccessful.equals(excludeAddress))) {
+            sb.append(lastSuccessful).append("\n");
+        }
+
+        // Get all DNS servers
+        String allServers = getDnsServersForAutoSearch();
+
+        // Add remaining servers (excluding last successful and excluded address)
+        if (allServers != null && !allServers.isEmpty()) {
+            String[] servers = allServers.split("\n");
+            for (String server : servers) {
+                server = server.trim();
+                if (!server.isEmpty() &&
+                    (lastSuccessful == null || !server.equals(lastSuccessful)) &&
+                    (excludeAddress == null || !server.equals(excludeAddress))) {
+                    sb.append(server).append("\n");
+                }
+            }
+        }
+
+        return sb.toString();
+    }
 }

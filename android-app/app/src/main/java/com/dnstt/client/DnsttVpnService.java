@@ -129,8 +129,8 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
                 onStatusChange(1, "Establishing DNS tunnel...");
 
                 // Retry logic for port binding issues
-                int maxRetries = 3;
-                int retryDelay = 800; // ms
+                int maxRetries = 5;
+                int retryDelay = 1500; // ms - start with longer delay
                 Exception lastException = null;
 
                 for (int attempt = 1; attempt <= maxRetries; attempt++) {
@@ -150,7 +150,7 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
                                 onStatusChange(1, "Port busy, retrying in " + (retryDelay/1000.0) + "s...");
                                 Thread.sleep(retryDelay);
                                 // Exponential backoff: increase delay for next retry
-                                retryDelay = (int)(retryDelay * 1.5);
+                                retryDelay = (int)(retryDelay * 1.3);
                             } else {
                                 log("Failed to bind port after " + maxRetries + " attempts");
                                 throw e; // Out of retries, throw to outer catch
@@ -397,7 +397,8 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
 
                 // Give OS time to release port 1080 from TIME_WAIT state
                 // This prevents "address already in use" on quick reconnections
-                Thread.sleep(500);
+                // Increased to 1500ms for better reliability
+                Thread.sleep(1500);
                 log("Port cleanup delay completed");
             } catch (InterruptedException e) {
                 log("Cleanup delay interrupted: " + e.getMessage());

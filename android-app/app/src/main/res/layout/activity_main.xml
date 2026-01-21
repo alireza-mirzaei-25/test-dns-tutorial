@@ -123,6 +123,16 @@
                     android:layout_marginTop="20dp"
                     android:text="@string/connect" />
 
+                <!-- Retry Button (shown only when connected) -->
+                <com.google.android.material.button.MaterialButton
+                    android:id="@+id/retryButton"
+                    style="@style/Widget.App.Button.Outline"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:layout_marginTop="8dp"
+                    android:text="It doesn't work"
+                    android:visibility="gone" />
+
                 <!-- Quick Options -->
                 <LinearLayout
                     android:layout_width="match_parent"
@@ -225,6 +235,76 @@
                             app:thumbTint="@color/switch_thumb_selector"
                             app:trackTint="@color/switch_track_selector" />
 
+                    </LinearLayout>
+
+                    <!-- Parallel Threads Setting -->
+                    <LinearLayout
+                        android:id="@+id/parallelThreadsLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginTop="8dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="Parallel Threads"
+                            android:textSize="14sp"
+                            android:textColor="@color/text_secondary" />
+
+                        <com.google.android.material.textfield.TextInputLayout
+                            style="@style/Widget.MaterialComponents.TextInputLayout.FilledBox.Dense"
+                            android:layout_width="80dp"
+                            android:layout_height="wrap_content"
+                            android:hint="1-10"
+                            app:boxBackgroundColor="@color/background_surface">
+
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/parallelThreadsInput"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:inputType="number"
+                                android:text="5"
+                                android:textSize="14sp"
+                                android:textColor="@color/text_primary" />
+                        </com.google.android.material.textfield.TextInputLayout>
+                    </LinearLayout>
+
+                    <!-- DNS Timeout Setting -->
+                    <LinearLayout
+                        android:id="@+id/dnsTimeoutLayout"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginTop="8dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="DNS Timeout (ms)"
+                            android:textSize="14sp"
+                            android:textColor="@color/text_secondary" />
+
+                        <com.google.android.material.textfield.TextInputLayout
+                            style="@style/Widget.MaterialComponents.TextInputLayout.FilledBox.Dense"
+                            android:layout_width="100dp"
+                            android:layout_height="wrap_content"
+                            android:hint="500-10000"
+                            app:boxBackgroundColor="@color/background_surface">
+
+                            <com.google.android.material.textfield.TextInputEditText
+                                android:id="@+id/dnsTimeoutInput"
+                                android:layout_width="match_parent"
+                                android:layout_height="wrap_content"
+                                android:inputType="number"
+                                android:text="3000"
+                                android:textSize="14sp"
+                                android:textColor="@color/text_primary" />
+                        </com.google.android.material.textfield.TextInputLayout>
                     </LinearLayout>
 
                     <!-- DNS Source Dropdown -->
