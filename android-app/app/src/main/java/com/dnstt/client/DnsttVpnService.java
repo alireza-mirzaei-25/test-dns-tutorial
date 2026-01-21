@@ -41,13 +41,18 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
     private Client dnsttClient;
     private TProxyService tun2socks;
     private volatile boolean running = false;
+    private volatile boolean stopping = false;
     private Thread statsThread;
 
-    // Callback for UI updates
-    private static StatusCallback uiCallback;
+    // Callback for UI updates - use WeakReference to prevent memory leaks
+    private static java.lang.ref.WeakReference<StatusCallback> uiCallbackRef;
 
     public static void setUiCallback(StatusCallback callback) {
-        uiCallback = callback;
+        uiCallbackRef = callback != null ? new java.lang.ref.WeakReference<>(callback) : null;
+    }
+
+    private static StatusCallback getUiCallback() {
+        return uiCallbackRef != null ? uiCallbackRef.get() : null;
     }
 
     @Override
@@ -238,11 +243,13 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
             long lastRxBytes = 0;
             long lastUpdateTime = System.currentTimeMillis();
 
-            while (running) {
+            while (running && !stopping) {
                 try {
                     Thread.sleep(1000);
 
-                    if (!running) break;
+                    if (!running || stopping) break;
+
+                    if (tun2socks == null) break;
 
                     long[] stats = tun2socks.TProxyGetStats();
                     if (stats != null && stats.length >= 4) {
@@ -259,8 +266,9 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
                         }
 
                         // Report to UI
-                        if (uiCallback != null) {
-                            uiCallback.onBytesTransferred(rxBytes, txBytes);
+                        StatusCallback callback = getUiCallback();
+                        if (callback != null) {
+                            callback.onBytesTransferred(rxBytes, txBytes);
                         }
 
                         // Update notification with live stats
@@ -283,6 +291,7 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
                     log("Stats error: " + e.getMessage());
                 }
             }
+            log("Stats monitor stopped");
         }, "StatsThread");
         statsThread.start();
     }
@@ -298,27 +307,41 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
         log("Stopping VPN...");
 
         // Prevent multiple stop calls
+        if (stopping) {
+            log("Stop already in progress");
+            return;
+        }
+
         if (!running && vpnInterface == null && dnsttClient == null) {
             log("VPN already stopped");
             onStatusChange(0, "Disconnected");
             return;
         }
 
+        stopping = true;
         running = false;
 
         // Stop stats thread
-        if (statsThread != null) {
+        if (statsThread != null && statsThread.isAlive()) {
+            log("Stopping stats thread...");
             statsThread.interrupt();
+            try {
+                statsThread.join(2000); // Wait up to 2 seconds for thread to finish
+            } catch (InterruptedException e) {
+                log("Interrupted while waiting for stats thread");
+            }
             statsThread = null;
         }
 
         // Stop tun2socks first
-        try {
-            log("Stopping tun2socks...");
-            tun2socks.TProxyStopService();
-            log("tun2socks stopped");
-        } catch (Exception e) {
-            log("Error stopping tun2socks: " + e.getMessage());
+        if (tun2socks != null) {
+            try {
+                log("Stopping tun2socks...");
+                tun2socks.TProxyStopService();
+                log("tun2socks stopped");
+            } catch (Exception e) {
+                log("Error stopping tun2socks: " + e.getMessage());
+            }
         }
 
         // Close VPN interface
@@ -347,6 +370,7 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
         // Notify UI BEFORE stopping the service
         onStatusChange(0, "Disconnected");
 
+        stopping = false;
         stopForeground(true);
         stopSelf();
         log("VPN service stopped");
@@ -369,23 +393,26 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
             updateNotification("Error");
         }
 
-        if (uiCallback != null) {
-            uiCallback.onStatusChange(state, message);
+        StatusCallback callback = getUiCallback();
+        if (callback != null) {
+            callback.onStatusChange(state, message);
         }
     }
 
     @Override
     public void onBytesTransferred(long bytesIn, long bytesOut) {
-        if (uiCallback != null) {
-            uiCallback.onBytesTransferred(bytesIn, bytesOut);
+        StatusCallback callback = getUiCallback();
+        if (callback != null) {
+            callback.onBytesTransferred(bytesIn, bytesOut);
         }
     }
 
     private void log(String message) {
         Log.d(TAG, message);
         // Also send to UI if callback is set
-        if (uiCallback != null) {
-            uiCallback.onStatusChange(-1, "[VPN] " + message);
+        StatusCallback callback = getUiCallback();
+        if (callback != null) {
+            callback.onStatusChange(-1, "[VPN] " + message);
         }
     }
 

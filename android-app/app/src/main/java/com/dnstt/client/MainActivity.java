@@ -14,6 +14,10 @@ import android.widget.ArrayAdapter;
 import android.widget.AutoCompleteTextView;
 import android.widget.ProgressBar;
 import android.widget.TextView;
+import android.widget.Toast;
+
+import java.util.ArrayList;
+import java.util.List;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
@@ -39,13 +43,17 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
     private Client client;
     private Handler handler;
-    private boolean isConnected = false;
+    private volatile boolean isConnected = false;
+    private volatile boolean isSearching = false;
+    private volatile boolean cancelSearch = false;
     private boolean vpnMode = true;
     private boolean autoConnect = false;
     private boolean useAutoDns = true;  // Auto DNS: test and select best resolver
     private boolean hasAutoConnected = false;
 
     private DnsServerManager dnsServerManager;
+    private Thread searchThread = null;
+    private static final long SEARCH_TIMEOUT_MS = 60000; // 60 seconds total timeout for DNS search
 
     // DoH provider presets - name -> URL mapping
     private static final String[][] DOH_PROVIDERS = {
@@ -90,9 +98,17 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     private SwitchMaterial autoConnectSwitch;
     private SwitchMaterial autoDnsSwitch;
     private TextView autoDnsLabel;
+    private AutoCompleteTextView dnsSourceDropdown;
+    private MaterialButton btnConfigureDns;
 
     // App updater
     private AppUpdater appUpdater;
+
+    // DNS config manager
+    private DnsConfigManager dnsConfigManager;
+
+    // Activity result launcher for configuration activity
+    private ActivityResultLauncher<Intent> configActivityLauncher;
 
     // Connection quality tracking
     private long lastBytesIn = 0;
@@ -118,6 +134,27 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         // Initialize DNS server manager
         dnsServerManager = new DnsServerManager(this);
         appendLog("Loaded " + dnsServerManager.getServerCount() + " DNS servers");
+
+        // Initialize DNS config manager
+        dnsConfigManager = new DnsConfigManager(this);
+
+        // Register Configuration Activity launcher
+        configActivityLauncher = registerForActivityResult(
+                new ActivityResultContracts.StartActivityForResult(),
+                result -> {
+                    // Refresh dropdown (user might have added/deleted custom lists)
+                    setupDnsSourceDropdown();
+
+                    if (result.getResultCode() == RESULT_OK && result.getData() != null) {
+                        String selectedDns = result.getData().getStringExtra("selected_dns");
+                        String selectedDnsName = result.getData().getStringExtra("selected_dns_name");
+
+                        if (selectedDns != null) {
+                            handleDnsSelection(selectedDns, selectedDnsName);
+                        }
+                    }
+                }
+        );
 
         // Register VPN permission launcher
         vpnPermissionLauncher = registerForActivityResult(
@@ -188,15 +225,29 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         autoConnectSwitch = findViewById(R.id.autoConnectSwitch);
         autoDnsSwitch = findViewById(R.id.autoDnsSwitch);
         autoDnsLabel = findViewById(R.id.autoDnsLabel);
+        dnsSourceDropdown = findViewById(R.id.dnsSourceDropdown);
+        btnConfigureDns = findViewById(R.id.btnConfigureDns);
 
         // Set version text
         versionText.setText("v" + appUpdater.getCurrentVersion());
+
+        // Setup DNS source dropdown
+        setupDnsSourceDropdown();
+
+        // Setup configure DNS button
+        btnConfigureDns.setOnClickListener(v -> {
+            Intent intent = new Intent(this, ConfigurationActivity.class);
+            configActivityLauncher.launch(intent);
+        });
 
         // Setup update button
         updateButton.setOnClickListener(v -> checkForUpdates());
 
         connectButton.setOnClickListener(v -> {
-            if (isConnected) {
+            if (isSearching) {
+                // Cancel search if currently searching
+                cancelDnsSearch();
+            } else if (isConnected) {
                 disconnect();
             } else {
                 connect();
@@ -360,6 +411,99 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         });
     }
 
+    private void setupDnsSourceDropdown() {
+        // Get list of DNS sources
+        List<String> sources = new ArrayList<>();
+        sources.add("Global DNS");
+
+        // Add custom lists
+        List<com.dnstt.client.models.CustomDnsList> customLists = dnsConfigManager.getCustomLists();
+        for (com.dnstt.client.models.CustomDnsList list : customLists) {
+            sources.add(list.getName());
+        }
+
+        // Create adapter for dropdown
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                android.R.layout.simple_dropdown_item_1line, sources);
+        dnsSourceDropdown.setAdapter(adapter);
+
+        // Make it non-editable but clickable (dropdown only)
+        dnsSourceDropdown.setKeyListener(null);
+        dnsSourceDropdown.setFocusable(false);
+        dnsSourceDropdown.setClickable(true);
+
+        // Set current selection
+        String selectedSource = dnsConfigManager.getSelectedSourceDisplayName();
+        dnsSourceDropdown.setText(selectedSource, false);
+
+        // Handle dropdown item selection
+        dnsSourceDropdown.setOnItemClickListener((parent, view, position, id) -> {
+            String selected = sources.get(position);
+
+            if (selected.equals("Global DNS")) {
+                dnsConfigManager.setSelectedSource(DnsConfigManager.SOURCE_GLOBAL, null);
+                appendLog("DNS Source changed to: Global DNS");
+                Toast.makeText(this, "Using Global DNS for Auto DNS", Toast.LENGTH_SHORT).show();
+            } else {
+                // Find the custom list by name
+                for (com.dnstt.client.models.CustomDnsList list : customLists) {
+                    if (list.getName().equals(selected)) {
+                        dnsConfigManager.setSelectedSource(DnsConfigManager.SOURCE_CUSTOM, list.getId());
+                        appendLog("DNS Source changed to: " + list.getName() + " (" + list.getSize() + " servers)");
+                        Toast.makeText(this, "Using " + list.getName() + " for Auto DNS", Toast.LENGTH_SHORT).show();
+                        break;
+                    }
+                }
+            }
+            saveSettings();
+        });
+
+        // Show dropdown when clicked
+        dnsSourceDropdown.setOnClickListener(v -> {
+            dnsSourceDropdown.showDropDown();
+        });
+    }
+
+    private void handleDnsSelection(String dnsAddress, String dnsName) {
+        appendLog("DNS selected: " + dnsName + " (" + dnsAddress + ")");
+
+        // Stop VPN if running
+        if (isConnected) {
+            appendLog("Stopping current connection...");
+            disconnect();
+
+            // Wait a moment for disconnect to complete
+            handler.postDelayed(() -> applySelectedDns(dnsAddress, dnsName), 1500);
+        } else {
+            applySelectedDns(dnsAddress, dnsName);
+        }
+    }
+
+    private void applySelectedDns(String dnsAddress, String dnsName) {
+        // Disable auto DNS
+        useAutoDns = false;
+        autoDnsSwitch.setChecked(false);
+        updateAutoDnsLabel();
+
+        // Set UDP transport
+        transportType.setText("UDP", false);
+
+        // Set the DNS address
+        transportAddr.setText(dnsAddress);
+        transportAddr.setEnabled(true);
+
+        // Update visibility
+        dohProviderLayout.setVisibility(View.GONE);
+        transportAddrLayout.setVisibility(View.VISIBLE);
+
+        appendLog("Ready to connect with " + dnsName);
+        appendLog("Auto DNS disabled - using selected DNS");
+
+        saveSettings();
+
+        Toast.makeText(this, "DNS configured: " + dnsName, Toast.LENGTH_SHORT).show();
+    }
+
     private void connect() {
         if (!hasValidSettings()) {
             appendLog("Error: Domain and public key are required");
@@ -379,6 +523,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         // If using Auto DNS and UDP, test resolvers and select the best one
         if (useAutoDns && type.equalsIgnoreCase("UDP")) {
             appendLog("Auto DNS: Testing resolvers to find best one...");
+            // Use selected DNS source
             testAndConnectWithBestResolver(dom, numTunnels);
             return;
         }
@@ -405,74 +550,146 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     }
 
     private void testAndConnectWithBestResolver(String dom, int numTunnels) {
-        String pubkeyHex = getText(pubkey);
+        if (isSearching) {
+            appendLog("Search already in progress");
+            return;
+        }
 
-        // Get resolvers from DNS server manager (shuffled for randomness)
-        String resolvers = dnsServerManager.getAllServersAsString();
-        int totalResolvers = dnsServerManager.getServerCount();
+        String pubkeyHex = getText(pubkey);
+        if (pubkeyHex == null || pubkeyHex.isEmpty()) {
+            appendLog("Error: Public key is required");
+            return;
+        }
+
+        // Get resolvers from selected DNS source (DnsConfigManager or DnsServerManager)
+        String resolvers = dnsConfigManager.getDnsServersForAutoSearch();
+        // Count resolvers
+        int totalResolvers = resolvers.split("\n").length;
+        if (totalResolvers == 0) {
+            appendLog("ERROR: No DNS servers available in selected source");
+            appendLog("Please add DNS servers or switch to Global DNS");
+            connectButton.setText(R.string.connect);
+            statusText.setText(R.string.status_disconnected);
+            statusText.setTextColor(getColor(R.color.disconnected));
+            statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+            setInputsEnabled(true);
+            return;
+        }
 
         // Update button to show testing state
-        connectButton.setText("Finding...");
+        isSearching = true;
+        cancelSearch = false;
+        connectButton.setText("Cancel");
         statusText.setText("Finding working resolver...");
         statusText.setTextColor(getColor(R.color.connecting));
+        statusCircle.setBackgroundResource(R.drawable.status_circle_connecting);
 
-        new Thread(() -> {
-            handler.post(() -> appendLog("Finding first working resolver from " + totalResolvers + " candidates..."));
+        searchThread = new Thread(() -> {
+            final long searchStartTime = System.currentTimeMillis();
+
+            handler.post(() -> appendLog("Finding first working resolver from " + totalResolvers + " candidates... (timeout: " + (SEARCH_TIMEOUT_MS / 1000) + "s)"));
 
             // Create resolver callback for progress updates
             ResolverCallback callback = new ResolverCallback() {
                 @Override
                 public void onProgress(long tested, long total, String currentResolver) {
+                    if (cancelSearch || (System.currentTimeMillis() - searchStartTime) > SEARCH_TIMEOUT_MS) {
+                        return;
+                    }
                     handler.post(() -> {
-                        statusText.setText("Testing: " + tested + "/" + total);
+                        if (!cancelSearch && isSearching) {
+                            statusText.setText("Testing: " + tested + "/" + total);
+                        }
                     });
                 }
 
                 @Override
                 public void onResult(String resolver, boolean success, long latencyMs, String errorMsg) {
+                    if (cancelSearch || (System.currentTimeMillis() - searchStartTime) > SEARCH_TIMEOUT_MS) {
+                        return;
+                    }
                     if (success) {
                         handler.post(() -> {
-                            appendLog("FOUND: " + resolver + " (" + latencyMs + "ms)");
-                            // Store latency for display
-                            currentLatencyMs = latencyMs;
-                            latencyText.setText(latencyMs + " ms");
+                            if (!cancelSearch && isSearching) {
+                                appendLog("FOUND: " + resolver + " (" + latencyMs + "ms)");
+                                // Store latency for display
+                                currentLatencyMs = latencyMs;
+                                latencyText.setText(latencyMs + " ms");
+                            }
                         });
                     } else {
                         // Only log failures occasionally to avoid spam
-                        handler.post(() -> appendLog("Skip: " + resolver));
+                        handler.post(() -> {
+                            if (!cancelSearch && isSearching) {
+                                appendLog("Skip: " + resolver);
+                            }
+                        });
                     }
                 }
             };
 
             // Find first working resolver (sequential, stops on first success)
             // This is fast because it stops as soon as it finds a working resolver
-            String workingResolver = Mobile.findFirstWorkingResolver(
-                    resolvers,
-                    dom,
-                    pubkeyHex,
-                    3000,  // 3 second timeout per resolver
-                    callback
-            );
+            String workingResolver = null;
+            try {
+                workingResolver = Mobile.findFirstWorkingResolver(
+                        resolvers,
+                        dom,
+                        pubkeyHex,
+                        3000,  // 3 second timeout per resolver
+                        callback
+                );
+            } catch (Exception e) {
+                handler.post(() -> appendLog("Search error: " + e.getMessage()));
+            }
 
-            if (workingResolver == null || workingResolver.isEmpty()) {
-                handler.post(() -> {
+            // Check for timeout
+            final long searchDuration = System.currentTimeMillis() - searchStartTime;
+            final boolean timedOut = searchDuration > SEARCH_TIMEOUT_MS;
+            final String finalResolver = workingResolver;
+
+            handler.post(() -> {
+                isSearching = false;
+
+                if (cancelSearch) {
+                    appendLog("DNS search cancelled by user");
+                    connectButton.setText(R.string.connect);
+                    statusText.setText(R.string.status_disconnected);
+                    statusText.setTextColor(getColor(R.color.disconnected));
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                    setInputsEnabled(true);
+                    cancelSearch = false;
+                    return;
+                }
+
+                if (timedOut) {
+                    appendLog("ERROR: DNS search timed out after " + (searchDuration / 1000) + " seconds");
+                    appendLog("Try switching to DoH or DoT transport");
+                    connectButton.setText(R.string.connect);
+                    statusText.setText(R.string.status_disconnected);
+                    statusText.setTextColor(getColor(R.color.disconnected));
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                    setInputsEnabled(true);
+                    return;
+                }
+
+                if (finalResolver == null || finalResolver.isEmpty()) {
                     appendLog("ERROR: No working resolver found!");
                     appendLog("Try switching to DoH or DoT transport");
                     connectButton.setText(R.string.connect);
                     statusText.setText(R.string.status_disconnected);
                     statusText.setTextColor(getColor(R.color.disconnected));
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
                     setInputsEnabled(true);
-                });
-                return;
-            }
+                    return;
+                }
 
-            handler.post(() -> {
-                appendLog("Using resolver: " + workingResolver);
-                transportAddr.setText(workingResolver);
+                appendLog("Using resolver: " + finalResolver);
+                transportAddr.setText(finalResolver);
                 connectButton.setText(R.string.disconnect);
 
                 // Now connect with the working resolver
-                appendLog("Connecting via " + workingResolver);
+                appendLog("Connecting via " + finalResolver);
 
                 if (vpnMode) {
                     appendLog("Requesting VPN permission...");
@@ -488,7 +705,34 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                     connectSocksProxy();
                 }
             });
-        }).start();
+        }, "DNSSearchThread");
+        searchThread.start();
+    }
+
+    private void cancelDnsSearch() {
+        if (!isSearching) {
+            return;
+        }
+
+        appendLog("Cancelling DNS search...");
+        cancelSearch = true;
+        isSearching = false;
+
+        // Interrupt the search thread
+        if (searchThread != null && searchThread.isAlive()) {
+            searchThread.interrupt();
+            searchThread = null;
+        }
+
+        // Update UI immediately
+        handler.post(() -> {
+            connectButton.setText(R.string.connect);
+            connectButton.setEnabled(true);
+            statusText.setText(R.string.status_disconnected);
+            statusText.setTextColor(getColor(R.color.disconnected));
+            statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+            setInputsEnabled(true);
+        });
     }
 
     private void startVpnService() {
@@ -549,6 +793,11 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         connectButton.setEnabled(false);  // Prevent double-clicks
         connectButton.setText("Stopping...");
 
+        // Cancel any ongoing search
+        if (isSearching) {
+            cancelDnsSearch();
+        }
+
         if (vpnMode) {
             // Stop VPN service
             Intent intent = new Intent(this, DnsttVpnService.class);
@@ -556,17 +805,27 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
             startForegroundService(intent);
         } else {
             new Thread(() -> {
-                client.stop();
+                try {
+                    if (client != null) {
+                        client.stop();
+                    }
+                } catch (Exception e) {
+                    handler.post(() -> appendLog("Error stopping client: " + e.getMessage()));
+                }
                 handler.post(() -> {
                     connectButton.setEnabled(true);
                     setInputsEnabled(true);
                 });
-            }).start();
+            }, "DisconnectThread").start();
         }
     }
 
     private String getText(TextInputEditText editText) {
-        return editText.getText() != null ? editText.getText().toString() : "";
+        if (editText == null) {
+            return "";
+        }
+        CharSequence text = editText.getText();
+        return text != null ? text.toString().trim() : "";
     }
 
     private void setInputsEnabled(boolean enabled) {
@@ -586,132 +845,162 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     }
 
     private void appendLog(String message) {
-        handler.post(() -> {
-            String timestamp = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
-                    .format(new java.util.Date());
-            String logLine = "[" + timestamp + "] " + message;
+        if (handler == null || logText == null) {
+            return;
+        }
 
-            String current = logText.getText().toString();
-            String newText = logLine + "\n" + current;
-            // Keep last 50 lines for more history
-            String[] lines = newText.split("\n");
-            if (lines.length > 50) {
-                StringBuilder sb = new StringBuilder();
-                for (int i = 0; i < 50; i++) {
-                    sb.append(lines[i]).append("\n");
+        handler.post(() -> {
+            try {
+                String timestamp = new java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+                        .format(new java.util.Date());
+                String logLine = "[" + timestamp + "] " + message;
+
+                String current = logText.getText() != null ? logText.getText().toString() : "";
+                String newText = logLine + "\n" + current;
+                // Keep last 50 lines for more history
+                String[] lines = newText.split("\n");
+                if (lines.length > 50) {
+                    StringBuilder sb = new StringBuilder();
+                    for (int i = 0; i < 50; i++) {
+                        sb.append(lines[i]).append("\n");
+                    }
+                    newText = sb.toString();
                 }
-                newText = sb.toString();
+                logText.setText(newText);
+            } catch (Exception e) {
+                // Ignore errors in logging
             }
-            logText.setText(newText);
         });
     }
 
     @Override
     public void onStatusChange(long state, String message) {
+        if (handler == null) {
+            return;
+        }
+
         handler.post(() -> {
-            // Don't show internal VPN logs in status bar, just in log
-            if (state == -1) {
+            try {
+                // Don't show internal VPN logs in status bar, just in log
+                if (state == -1) {
+                    appendLog(message);
+                    return;
+                }
+
                 appendLog(message);
-                return;
-            }
 
-            appendLog(message);
+                // Reset searching state when connection state changes
+                if (state != 1) { // Not connecting
+                    isSearching = false;
+                    cancelSearch = false;
+                }
 
-            switch ((int) state) {
-                case 0: // Stopped
-                    statusText.setText(R.string.status_disconnected);
-                    statusText.setTextColor(getColor(R.color.disconnected));
-                    statusSubtext.setText("Tap connect to start");
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
-                    connectButton.setText(R.string.connect);
-                    connectButton.setEnabled(true);
-                    isConnected = false;
-                    setInputsEnabled(true);
-                    // Hide stats card
-                    statsCard.setVisibility(View.GONE);
-                    qualityText.setText("--");
-                    latencyText.setText("-- ms");
-                    speedText.setText("-- KB/s");
-                    lastBytesIn = 0;
-                    lastBytesOut = 0;
-                    lastUpdateTime = 0;
-                    break;
-                case 1: // Connecting
-                    statusText.setText(R.string.status_connecting);
-                    statusText.setTextColor(getColor(R.color.connecting));
-                    statusSubtext.setText("Establishing connection...");
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_connecting);
-                    connectButton.setText(R.string.disconnect);
-                    isConnected = false;
-                    break;
-                case 2: // Connected
-                    statusText.setText(R.string.status_connected);
-                    statusText.setTextColor(getColor(R.color.connected));
-                    statusSubtext.setText("Your traffic is protected");
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_connected);
-                    connectButton.setText(R.string.disconnect);
-                    isConnected = true;
-                    // Show stats card
-                    statsCard.setVisibility(View.VISIBLE);
-                    break;
-                case 3: // Error
-                    statusText.setText("Error");
-                    statusText.setTextColor(getColor(R.color.disconnected));
-                    statusSubtext.setText("Connection failed");
-                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
-                    connectButton.setText(R.string.connect);
-                    connectButton.setEnabled(true);
-                    isConnected = false;
-                    setInputsEnabled(true);
-                    break;
+                switch ((int) state) {
+                    case 0: // Stopped
+                        if (statusText != null) statusText.setText(R.string.status_disconnected);
+                        if (statusText != null) statusText.setTextColor(getColor(R.color.disconnected));
+                        if (statusSubtext != null) statusSubtext.setText("Tap connect to start");
+                        if (statusCircle != null) statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                        if (connectButton != null) connectButton.setText(R.string.connect);
+                        if (connectButton != null) connectButton.setEnabled(true);
+                        isConnected = false;
+                        setInputsEnabled(true);
+                        // Hide stats card
+                        if (statsCard != null) statsCard.setVisibility(View.GONE);
+                        if (qualityText != null) qualityText.setText("--");
+                        if (latencyText != null) latencyText.setText("-- ms");
+                        if (speedText != null) speedText.setText("-- KB/s");
+                        lastBytesIn = 0;
+                        lastBytesOut = 0;
+                        lastUpdateTime = 0;
+                        break;
+                    case 1: // Connecting
+                        if (statusText != null) statusText.setText(R.string.status_connecting);
+                        if (statusText != null) statusText.setTextColor(getColor(R.color.connecting));
+                        if (statusSubtext != null) statusSubtext.setText("Establishing connection...");
+                        if (statusCircle != null) statusCircle.setBackgroundResource(R.drawable.status_circle_connecting);
+                        if (connectButton != null) connectButton.setText(R.string.disconnect);
+                        isConnected = false;
+                        break;
+                    case 2: // Connected
+                        if (statusText != null) statusText.setText(R.string.status_connected);
+                        if (statusText != null) statusText.setTextColor(getColor(R.color.connected));
+                        if (statusSubtext != null) statusSubtext.setText("Your traffic is protected");
+                        if (statusCircle != null) statusCircle.setBackgroundResource(R.drawable.status_circle_connected);
+                        if (connectButton != null) connectButton.setText(R.string.disconnect);
+                        isConnected = true;
+                        // Show stats card
+                        if (statsCard != null) statsCard.setVisibility(View.VISIBLE);
+                        break;
+                    case 3: // Error
+                        if (statusText != null) statusText.setText("Error");
+                        if (statusText != null) statusText.setTextColor(getColor(R.color.disconnected));
+                        if (statusSubtext != null) statusSubtext.setText("Connection failed");
+                        if (statusCircle != null) statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
+                        if (connectButton != null) connectButton.setText(R.string.connect);
+                        if (connectButton != null) connectButton.setEnabled(true);
+                        isConnected = false;
+                        setInputsEnabled(true);
+                        break;
+                }
+            } catch (Exception e) {
+                // Ignore UI update errors
             }
         });
     }
 
     @Override
     public void onBytesTransferred(long bytesIn, long bytesOut) {
+        if (handler == null) {
+            return;
+        }
+
         handler.post(() -> {
-            bytesInText.setText(formatBytes(bytesIn));
-            bytesOutText.setText(formatBytes(bytesOut));
+            try {
+                if (bytesInText != null) bytesInText.setText(formatBytes(bytesIn));
+                if (bytesOutText != null) bytesOutText.setText(formatBytes(bytesOut));
 
-            // Calculate speed and update quality indicator
-            long currentTime = System.currentTimeMillis();
-            if (lastUpdateTime > 0 && isConnected) {
-                long timeDelta = currentTime - lastUpdateTime;
-                if (timeDelta > 0) {
-                    long bytesInDelta = bytesIn - lastBytesIn;
-                    long bytesOutDelta = bytesOut - lastBytesOut;
-                    long totalBytesDelta = bytesInDelta + bytesOutDelta;
+                // Calculate speed and update quality indicator
+                long currentTime = System.currentTimeMillis();
+                if (lastUpdateTime > 0 && isConnected) {
+                    long timeDelta = currentTime - lastUpdateTime;
+                    if (timeDelta > 0) {
+                        long bytesInDelta = bytesIn - lastBytesIn;
+                        long bytesOutDelta = bytesOut - lastBytesOut;
+                        long totalBytesDelta = bytesInDelta + bytesOutDelta;
 
-                    // Calculate speed in KB/s
-                    double speedKBps = (totalBytesDelta / 1024.0) / (timeDelta / 1000.0);
-                    speedText.setText(String.format("%.1f KB/s", speedKBps));
+                        // Calculate speed in KB/s
+                        double speedKBps = (totalBytesDelta / 1024.0) / (timeDelta / 1000.0);
+                        if (speedText != null) speedText.setText(String.format("%.1f KB/s", speedKBps));
 
-                    // Estimate latency from response time (rough approximation)
-                    // If we have data transfer, estimate latency based on throughput
-                    if (totalBytesDelta > 0 && currentLatencyMs == 0) {
-                        // Rough estimate: latency = timeDelta / number of round trips
-                        // Assume ~1KB per DNS query/response
-                        long estimatedRoundTrips = Math.max(1, totalBytesDelta / 1024);
-                        currentLatencyMs = timeDelta / estimatedRoundTrips;
-                        if (currentLatencyMs > 0 && currentLatencyMs < 5000) {
-                            latencyText.setText(currentLatencyMs + " ms");
+                        // Estimate latency from response time (rough approximation)
+                        // If we have data transfer, estimate latency based on throughput
+                        if (totalBytesDelta > 0 && currentLatencyMs == 0) {
+                            // Rough estimate: latency = timeDelta / number of round trips
+                            // Assume ~1KB per DNS query/response
+                            long estimatedRoundTrips = Math.max(1, totalBytesDelta / 1024);
+                            currentLatencyMs = timeDelta / estimatedRoundTrips;
+                            if (currentLatencyMs > 0 && currentLatencyMs < 5000 && latencyText != null) {
+                                latencyText.setText(currentLatencyMs + " ms");
+                            }
                         }
+
+                        // Update quality indicator based on speed
+                        updateConnectionQuality(speedKBps);
                     }
 
-                    // Update quality indicator based on speed
-                    updateConnectionQuality(speedKBps);
+                    // Show quality bar when connected
+                    if (qualityBarLayout != null && qualityBarLayout.getVisibility() != View.VISIBLE) {
+                        qualityBarLayout.setVisibility(View.VISIBLE);
+                    }
                 }
 
-                // Show quality bar when connected
-                if (qualityBarLayout.getVisibility() != View.VISIBLE) {
-                    qualityBarLayout.setVisibility(View.VISIBLE);
-                }
+                lastBytesIn = bytesIn;
+                lastBytesOut = bytesOut;
+                lastUpdateTime = currentTime;
+            } catch (Exception e) {
+                // Ignore UI update errors
             }
-
-            lastBytesIn = bytesIn;
-            lastBytesOut = bytesOut;
-            lastUpdateTime = currentTime;
         });
     }
 
@@ -818,13 +1107,41 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     @Override
     protected void onDestroy() {
         super.onDestroy();
+
+        // Cancel any ongoing search
+        if (isSearching) {
+            cancelSearch = true;
+            if (searchThread != null && searchThread.isAlive()) {
+                searchThread.interrupt();
+                searchThread = null;
+            }
+        }
+
+        // Remove UI callback to prevent memory leak
         DnsttVpnService.setUiCallback(null);
+
+        // Cleanup app updater
         if (appUpdater != null) {
             appUpdater.cleanup();
+            appUpdater = null;
         }
-        if (!vpnMode && isConnected) {
-            client.stop();
+
+        // Stop client if connected in non-VPN mode
+        if (!vpnMode && isConnected && client != null) {
+            try {
+                client.stop();
+            } catch (Exception e) {
+                // Ignore errors during cleanup
+            }
         }
+
+        // Remove all handler callbacks to prevent memory leaks
+        if (handler != null) {
+            handler.removeCallbacksAndMessages(null);
+        }
+
+        // Clear references
+        client = null;
     }
 
     private void checkForUpdates() {
