@@ -64,6 +64,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
     private DnsServerManager dnsServerManager;
     private Thread searchThread = null;
+    private ExecutorService dnsTestExecutor = null;  // Track parallel DNS testing executor
     private static final long SEARCH_TIMEOUT_MS = 60000; // 60 seconds total timeout for DNS search
 
     // DoH provider presets - name -> URL mapping
@@ -370,7 +371,24 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
     private void updateAutoDnsLabel() {
         if (useAutoDns) {
-            autoDnsLabel.setText("Auto DNS (" + dnsServerManager.getServerCount() + " servers)");
+            // Get server count based on selected source
+            int serverCount = 0;
+            String selectedSource = dnsConfigManager.getSelectedSource();
+
+            if (DnsConfigManager.SOURCE_GLOBAL.equals(selectedSource)) {
+                serverCount = dnsServerManager.getServerCount();
+            } else {
+                // Custom list selected
+                String listId = dnsConfigManager.getSelectedListId();
+                if (listId != null) {
+                    com.dnstt.client.models.CustomDnsList list = dnsConfigManager.getCustomList(listId);
+                    if (list != null) {
+                        serverCount = list.getSize();
+                    }
+                }
+            }
+
+            autoDnsLabel.setText("Auto DNS (" + serverCount + " servers)");
         } else {
             autoDnsLabel.setText("Auto DNS (manual mode)");
         }
@@ -530,6 +548,8 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                     }
                 }
             }
+            // Update Auto DNS label to reflect the new server count
+            updateAutoDnsLabel();
             saveSettings();
         });
 
@@ -663,7 +683,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         appendLog("Testing " + totalResolvers + " resolvers with " + parallelThreads + " parallel threads");
 
         String[] resolverArray = resolvers.split("\n");
-        ExecutorService executor = Executors.newFixedThreadPool(parallelThreads);
+        dnsTestExecutor = Executors.newFixedThreadPool(parallelThreads);  // Track executor for cleanup
         AtomicReference<String> foundResolver = new AtomicReference<>(null);
         AtomicInteger testedCount = new AtomicInteger(0);
         CountDownLatch latch = new CountDownLatch(1);
@@ -674,7 +694,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         for (String resolver : resolverArray) {
             if (resolver.trim().isEmpty()) continue;
 
-            executor.submit(() -> {
+            dnsTestExecutor.submit(() -> {
                 if (foundResolver.get() != null || cancelSearch) {
                     return; // Already found or cancelled
                 }
@@ -735,7 +755,10 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         new Thread(() -> {
             try {
                 boolean found = latch.await(SEARCH_TIMEOUT_MS, TimeUnit.MILLISECONDS);
-                executor.shutdownNow(); // Stop all threads
+                if (dnsTestExecutor != null) {
+                    dnsTestExecutor.shutdownNow(); // Stop all threads
+                    dnsTestExecutor = null;
+                }
 
                 final String workingResolver = foundResolver.get();
                 final long searchDuration = System.currentTimeMillis() - searchStartTime;
@@ -791,7 +814,10 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                     }
                 });
             } catch (InterruptedException e) {
-                executor.shutdownNow();
+                if (dnsTestExecutor != null) {
+                    dnsTestExecutor.shutdownNow();
+                    dnsTestExecutor = null;
+                }
                 handler.post(() -> {
                     isSearching = false;
                     appendLog("ERROR: Search interrupted");
@@ -845,6 +871,13 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         appendLog("Cancelling DNS search...");
         cancelSearch = true;
         isSearching = false;
+
+        // Shutdown parallel DNS test executor immediately
+        if (dnsTestExecutor != null) {
+            appendLog("Stopping parallel DNS tests...");
+            dnsTestExecutor.shutdownNow();
+            dnsTestExecutor = null;
+        }
 
         // Interrupt the search thread
         if (searchThread != null && searchThread.isAlive()) {
@@ -924,6 +957,19 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         // Cancel any ongoing search
         if (isSearching) {
             cancelDnsSearch();
+        }
+
+        // Force shutdown any remaining DNS test executor
+        if (dnsTestExecutor != null) {
+            appendLog("Force stopping DNS tests...");
+            dnsTestExecutor.shutdownNow();
+            dnsTestExecutor = null;
+        }
+
+        // Interrupt any search threads
+        if (searchThread != null && searchThread.isAlive()) {
+            searchThread.interrupt();
+            searchThread = null;
         }
 
         if (vpnMode) {
@@ -1265,6 +1311,12 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                 searchThread.interrupt();
                 searchThread = null;
             }
+        }
+
+        // Shutdown DNS test executor
+        if (dnsTestExecutor != null) {
+            dnsTestExecutor.shutdownNow();
+            dnsTestExecutor = null;
         }
 
         // Remove UI callback to prevent memory leak
