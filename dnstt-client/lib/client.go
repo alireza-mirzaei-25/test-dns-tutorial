@@ -995,8 +995,11 @@ func CreateTunnelExported(
 	transportArg string,
 ) (*Tunnel, error) {
 	var utlsID *utls.ClientHelloID
+	// Handle the Go interface nil gotcha: interface{}((*T)(nil)) != nil
 	if utlsClientHelloID != nil {
-		utlsID = utlsClientHelloID.(*utls.ClientHelloID)
+		if id, ok := utlsClientHelloID.(*utls.ClientHelloID); ok && id != nil {
+			utlsID = id
+		}
 	}
 	return createTunnel(utlsID, pubkey, domain, mtu, transportType, transportArg)
 }

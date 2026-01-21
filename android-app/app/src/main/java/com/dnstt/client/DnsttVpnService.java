@@ -114,7 +114,7 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
         config.setListenAddr("127.0.0.1:1080");
         config.setTunnels(tunnels);
         config.setMTU(1232);
-        config.setUTLSFingerprint("Chrome");
+        config.setUTLSFingerprint("none"); // Use standard TLS - uTLS causes errors on Android
         config.setUseZstd(true); // Enable zstd compression (server has it on by default)
         log("Zstd compression: enabled");
 
@@ -236,6 +236,7 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
         statsThread = new Thread(() -> {
             long lastTxBytes = 0;
             long lastRxBytes = 0;
+            long lastUpdateTime = System.currentTimeMillis();
 
             while (running) {
                 try {
@@ -247,18 +248,34 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
                     if (stats != null && stats.length >= 4) {
                         long txBytes = stats[1];
                         long rxBytes = stats[3];
+                        long currentTime = System.currentTimeMillis();
+                        long timeDelta = currentTime - lastUpdateTime;
+
+                        // Calculate speed
+                        double speedKBps = 0;
+                        if (timeDelta > 0 && lastUpdateTime > 0) {
+                            long bytesDelta = (txBytes - lastTxBytes) + (rxBytes - lastRxBytes);
+                            speedKBps = (bytesDelta / 1024.0) / (timeDelta / 1000.0);
+                        }
 
                         // Report to UI
                         if (uiCallback != null) {
                             uiCallback.onBytesTransferred(rxBytes, txBytes);
                         }
 
+                        // Update notification with live stats
+                        String notifText = String.format("↓ %s  ↑ %s  •  %.1f KB/s",
+                                formatBytes(rxBytes), formatBytes(txBytes), speedKBps);
+                        updateNotification(notifText);
+
                         // Log significant changes
                         if (txBytes - lastTxBytes > 10000 || rxBytes - lastRxBytes > 10000) {
                             log("Traffic: TX=" + formatBytes(txBytes) + " RX=" + formatBytes(rxBytes));
-                            lastTxBytes = txBytes;
-                            lastRxBytes = rxBytes;
                         }
+
+                        lastTxBytes = txBytes;
+                        lastRxBytes = rxBytes;
+                        lastUpdateTime = currentTime;
                     }
                 } catch (InterruptedException e) {
                     break;
@@ -403,12 +420,16 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
         );
 
         return new NotificationCompat.Builder(this, CHANNEL_ID)
-                .setContentTitle("DNSTT VPN")
+                .setContentTitle("DNSTT VPN - Connected")
                 .setContentText(text)
-                .setSmallIcon(R.drawable.ic_launcher)
+                .setSmallIcon(R.drawable.ic_vpn_key)
                 .setContentIntent(pendingIntent)
                 .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Disconnect", stopPendingIntent)
                 .setOngoing(true)
+                .setShowWhen(false)
+                .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .setCategory(NotificationCompat.CATEGORY_SERVICE)
                 .build();
     }
 

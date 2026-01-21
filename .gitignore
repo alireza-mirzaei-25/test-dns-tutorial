@@ -2,3 +2,20 @@ dnstt-client/dnstt-client
 dnstt-server/dnstt-server
 
 .idea/
+
+# Build outputs
+dnstt-client-darwin-*
+dnstt-client-linux-*
+dnstt-server-*
+
+# Keystore and credentials (NEVER commit these)
+*.jks
+*.keystore
+keystore_base64.txt
+*.pub
+server.pub
+
+# Android build outputs
+android-app/app/build/
+android-app/.gradle/
+*.apk

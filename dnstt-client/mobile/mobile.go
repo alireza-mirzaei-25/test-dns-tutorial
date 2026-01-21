@@ -47,6 +47,7 @@ type Config struct {
 	mtu             int
 	utlsFingerprint string
 	useZstd         bool // Enable zstd compression (server must also have -zstd flag)
+	numParallel     int  // Number of parallel DNS query senders (1-16, higher = more throughput)
 }
 
 // NewConfig creates a default configuration.
@@ -57,8 +58,9 @@ func NewConfig() *Config {
 		listenAddr:      "127.0.0.1:1080",
 		tunnels:         8,
 		mtu:             1232,
-		utlsFingerprint: "Chrome",
-		useZstd:         true, // Default to enabled (server has it on by default)
+		utlsFingerprint: "none", // Use standard TLS - uTLS causes errors on Android
+		useZstd:         true,   // Default to enabled (server has it on by default)
+		numParallel:     8,      // Default parallel DNS senders for better throughput
 	}
 }
 
@@ -68,10 +70,11 @@ func (c *Config) SetTransportAddr(v string)   { c.transportAddr = v }
 func (c *Config) SetPubkeyHex(v string)       { c.pubkeyHex = v }
 func (c *Config) SetDomain(v string)          { c.domain = v }
 func (c *Config) SetListenAddr(v string)      { c.listenAddr = v }
-func (c *Config) SetTunnels(v int)            { c.tunnels = v }
+func (c *Config) SetTunnels(v int)            { c.tunnels = v; c.numParallel = v }
 func (c *Config) SetMTU(v int)                { c.mtu = v }
 func (c *Config) SetUTLSFingerprint(v string) { c.utlsFingerprint = v }
 func (c *Config) SetUseZstd(v bool)           { c.useZstd = v }
+func (c *Config) SetNumParallel(v int)        { c.numParallel = v }
 
 // Client represents a dnstt tunnel client for mobile.
 type Client struct {
@@ -157,14 +160,18 @@ func (c *Client) Start(cfg *Config) error {
 	// Parse uTLS fingerprint
 	var utlsID *utls.ClientHelloID
 	spec := cfg.utlsFingerprint
-	if spec == "" {
-		// Default to Chrome fingerprint
-		spec = "Chrome"
-	}
-	utlsID, err = dnstt.SampleUTLSDistribution(spec)
-	if err != nil {
-		c.setState(StateError, fmt.Sprintf("Invalid uTLS spec: %v", err))
-		return fmt.Errorf("invalid utls spec: %w", err)
+	if spec == "" || spec == "none" {
+		// Default to standard TLS (no uTLS fingerprinting)
+		// uTLS fingerprints cause "tls: unexpected message" errors on Android
+		utlsID = nil
+		log.Printf("using standard TLS (uTLS disabled)")
+	} else {
+		utlsID, err = dnstt.SampleUTLSDistribution(spec)
+		if err != nil {
+			c.setState(StateError, fmt.Sprintf("Invalid uTLS spec: %v", err))
+			return fmt.Errorf("invalid utls spec: %w", err)
+		}
+		log.Printf("using uTLS fingerprint: %s", spec)
 	}
 
 	// Create tunnel pool
@@ -188,6 +195,15 @@ func (c *Client) Start(cfg *Config) error {
 	dnstt.UseCompression = cfg.useZstd
 	if cfg.useZstd {
 		log.Printf("zstd compression enabled")
+	}
+
+	// Set parallel DNS senders for better throughput
+	if cfg.numParallel > 0 {
+		if cfg.numParallel > 16 {
+			cfg.numParallel = 16 // Cap at 16
+		}
+		dnstt.NumDNSSenders = cfg.numParallel
+		log.Printf("parallel DNS senders: %d", cfg.numParallel)
 	}
 
 	// Create tunnels

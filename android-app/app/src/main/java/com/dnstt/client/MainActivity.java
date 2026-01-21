@@ -3,21 +3,29 @@ package com.dnstt.client;
 import android.app.Activity;
 import android.content.Intent;
 import android.content.SharedPreferences;
+import android.graphics.Color;
+import android.net.Uri;
 import android.net.VpnService;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
+import android.view.View;
 import android.widget.ArrayAdapter;
 import android.widget.AutoCompleteTextView;
+import android.widget.ProgressBar;
 import android.widget.TextView;
 
 import androidx.activity.result.ActivityResultLauncher;
 import androidx.activity.result.contract.ActivityResultContracts;
 import androidx.appcompat.app.AppCompatActivity;
 
+import com.google.android.material.dialog.MaterialAlertDialogBuilder;
+
 import com.google.android.material.button.MaterialButton;
+import com.google.android.material.card.MaterialCardView;
 import com.google.android.material.switchmaterial.SwitchMaterial;
 import com.google.android.material.textfield.TextInputEditText;
+import com.google.android.material.textfield.TextInputLayout;
 
 import mobile.Client;
 import mobile.Config;
@@ -39,13 +47,41 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
     private DnsServerManager dnsServerManager;
 
+    // DoH provider presets - name -> URL mapping
+    private static final String[][] DOH_PROVIDERS = {
+        {"Google", "https://dns.google/dns-query"},
+        {"Cloudflare", "https://cloudflare-dns.com/dns-query"},
+        {"Cloudflare (1.1.1.1)", "https://1.1.1.1/dns-query"},
+        {"Quad9", "https://dns.quad9.net/dns-query"},
+        {"AdGuard", "https://dns.adguard.com/dns-query"},
+        {"NextDNS", "https://dns.nextdns.io/dns-query"},
+        {"OpenDNS", "https://doh.opendns.com/dns-query"},
+        {"Shecan (Iran)", "https://free.shecan.ir/dns-query"},
+        {"403.online (Iran)", "https://dns.403.online/dns-query"},
+        {"Electro (Iran)", "https://electro.ir/dns-query"},
+        {"Custom", ""}  // Custom option for manual entry
+    };
+
     // UI Elements
     private TextView statusText;
+    private TextView statusSubtext;
+    private View statusCircle;
     private MaterialButton connectButton;
+    private MaterialButton updateButton;
+    private TextView versionText;
+    private MaterialCardView statsCard;
     private TextView bytesInText;
     private TextView bytesOutText;
+    private TextView qualityText;
+    private TextView latencyText;
+    private TextView speedText;
+    private ProgressBar qualityBar;
+    private View qualityBarLayout;
     private TextView logText;
     private AutoCompleteTextView transportType;
+    private AutoCompleteTextView dohProvider;
+    private TextInputLayout dohProviderLayout;
+    private TextInputLayout transportAddrLayout;
     private TextInputEditText transportAddr;
     private TextInputEditText domain;
     private TextInputEditText pubkey;
@@ -54,6 +90,15 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     private SwitchMaterial autoConnectSwitch;
     private SwitchMaterial autoDnsSwitch;
     private TextView autoDnsLabel;
+
+    // App updater
+    private AppUpdater appUpdater;
+
+    // Connection quality tracking
+    private long lastBytesIn = 0;
+    private long lastBytesOut = 0;
+    private long lastUpdateTime = 0;
+    private long currentLatencyMs = 0;
 
     // VPN permission launcher
     private ActivityResultLauncher<Intent> vpnPermissionLauncher;
@@ -66,6 +111,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         handler = new Handler(Looper.getMainLooper());
         client = mobile.Mobile.newClient();
         client.setCallback(this);
+
+        // Initialize app updater
+        appUpdater = new AppUpdater(this);
 
         // Initialize DNS server manager
         dnsServerManager = new DnsServerManager(this);
@@ -114,11 +162,24 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
 
     private void initViews() {
         statusText = findViewById(R.id.statusText);
+        statusSubtext = findViewById(R.id.statusSubtext);
+        statusCircle = findViewById(R.id.statusCircle);
         connectButton = findViewById(R.id.connectButton);
+        updateButton = findViewById(R.id.updateButton);
+        versionText = findViewById(R.id.versionText);
+        statsCard = findViewById(R.id.statsCard);
         bytesInText = findViewById(R.id.bytesInText);
         bytesOutText = findViewById(R.id.bytesOutText);
+        qualityText = findViewById(R.id.qualityText);
+        latencyText = findViewById(R.id.latencyText);
+        speedText = findViewById(R.id.speedText);
+        qualityBar = findViewById(R.id.qualityBar);
+        qualityBarLayout = findViewById(R.id.qualityBarLayout);
         logText = findViewById(R.id.logText);
         transportType = findViewById(R.id.transportType);
+        dohProvider = findViewById(R.id.dohProvider);
+        dohProviderLayout = findViewById(R.id.dohProviderLayout);
+        transportAddrLayout = findViewById(R.id.transportAddrLayout);
         transportAddr = findViewById(R.id.transportAddr);
         domain = findViewById(R.id.domain);
         pubkey = findViewById(R.id.pubkey);
@@ -127,6 +188,12 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         autoConnectSwitch = findViewById(R.id.autoConnectSwitch);
         autoDnsSwitch = findViewById(R.id.autoDnsSwitch);
         autoDnsLabel = findViewById(R.id.autoDnsLabel);
+
+        // Set version text
+        versionText.setText("v" + appUpdater.getCurrentVersion());
+
+        // Setup update button
+        updateButton.setOnClickListener(v -> checkForUpdates());
 
         connectButton.setOnClickListener(v -> {
             if (isConnected) {
@@ -152,10 +219,27 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
             useAutoDns = isChecked;
             appendLog("Auto DNS " + (isChecked ? "enabled (will test resolvers)" : "disabled (manual mode)"));
             updateAutoDnsLabel();
-            // Enable/disable transport address field based on mode
-            transportAddr.setEnabled(!isChecked || !transportType.getText().toString().equalsIgnoreCase("UDP"));
+
+            if (isChecked) {
+                // Auto DNS only works with UDP - automatically switch to UDP
+                transportType.setText("UDP", false);
+                dohProviderLayout.setVisibility(View.GONE);
+                transportAddrLayout.setVisibility(View.VISIBLE);
+                transportAddr.setText("(auto-select best resolver)");
+                transportAddr.setEnabled(false);
+                appendLog("Transport switched to UDP for Auto DNS");
+            } else {
+                // Manual mode - enable transport address if UDP is selected
+                if (transportType.getText().toString().equalsIgnoreCase("UDP")) {
+                    transportAddr.setText("1.1.1.1:53");
+                    transportAddr.setEnabled(true);
+                }
+            }
             saveSettings();
         });
+
+        // Setup DoH provider dropdown
+        setupDohProviderDropdown();
     }
 
     private void updateAutoDnsLabel() {
@@ -166,25 +250,101 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         }
     }
 
+    private void setupDohProviderDropdown() {
+        // Create array of provider names
+        String[] providerNames = new String[DOH_PROVIDERS.length];
+        for (int i = 0; i < DOH_PROVIDERS.length; i++) {
+            providerNames[i] = DOH_PROVIDERS[i][0];
+        }
+
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+                R.layout.dropdown_item, providerNames);
+        dohProvider.setAdapter(adapter);
+
+        dohProvider.setOnItemClickListener((parent, view, position, id) -> {
+            String url = DOH_PROVIDERS[position][1];
+            if (position == DOH_PROVIDERS.length - 1) {
+                // Custom option - enable manual entry
+                transportAddrLayout.setVisibility(View.VISIBLE);
+                transportAddr.setEnabled(true);
+                transportAddr.setText("");
+                transportAddr.requestFocus();
+                appendLog("DoH Provider: Custom (enter URL manually)");
+            } else {
+                // Preset provider - set URL and hide manual entry
+                transportAddr.setText(url);
+                transportAddrLayout.setVisibility(View.GONE);
+                appendLog("DoH Provider: " + DOH_PROVIDERS[position][0]);
+            }
+            saveSettings();
+        });
+    }
+
+    private void updateDohProviderVisibility() {
+        String type = transportType.getText().toString();
+        boolean isDoH = type.equalsIgnoreCase("DoH");
+        dohProviderLayout.setVisibility(isDoH ? View.VISIBLE : View.GONE);
+
+        // Show transport address field if not DoH OR if Custom is selected
+        if (isDoH) {
+            String selectedProvider = dohProvider.getText().toString();
+            boolean isCustom = selectedProvider.equals("Custom");
+            transportAddrLayout.setVisibility(isCustom ? View.VISIBLE : View.GONE);
+        } else {
+            transportAddrLayout.setVisibility(View.VISIBLE);
+        }
+    }
+
     private void setupTransportDropdown() {
         String[] types = {"DoH", "DoT", "UDP"};
         ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
-                android.R.layout.simple_dropdown_item_1line, types);
+                R.layout.dropdown_item, types);
         transportType.setAdapter(adapter);
 
         transportType.setOnItemClickListener((parent, view, position, id) -> {
             switch (position) {
                 case 0: // DoH
-                    transportAddr.setText("https://dns.google/dns-query");
+                    // Auto DNS only works with UDP - disable it when switching to DoH
+                    if (useAutoDns) {
+                        useAutoDns = false;
+                        autoDnsSwitch.setChecked(false);
+                        updateAutoDnsLabel();
+                        appendLog("Auto DNS disabled (only works with UDP)");
+                    }
+                    // Show DoH provider dropdown, hide manual address
+                    dohProviderLayout.setVisibility(View.VISIBLE);
+                    String selectedProvider = dohProvider.getText().toString();
+                    boolean isCustom = selectedProvider.equals("Custom");
+                    transportAddrLayout.setVisibility(isCustom ? View.VISIBLE : View.GONE);
+                    // Set URL based on selected provider
+                    for (String[] provider : DOH_PROVIDERS) {
+                        if (provider[0].equals(selectedProvider)) {
+                            if (!provider[1].isEmpty()) {
+                                transportAddr.setText(provider[1]);
+                            }
+                            break;
+                        }
+                    }
                     transportAddr.setEnabled(true);
                     appendLog("Transport: DoH (DNS over HTTPS)");
                     break;
                 case 1: // DoT
+                    // Auto DNS only works with UDP - disable it when switching to DoT
+                    if (useAutoDns) {
+                        useAutoDns = false;
+                        autoDnsSwitch.setChecked(false);
+                        updateAutoDnsLabel();
+                        appendLog("Auto DNS disabled (only works with UDP)");
+                    }
+                    dohProviderLayout.setVisibility(View.GONE);
+                    transportAddrLayout.setVisibility(View.VISIBLE);
                     transportAddr.setText("dns.google:853");
                     transportAddr.setEnabled(true);
                     appendLog("Transport: DoT (DNS over TLS)");
                     break;
                 case 2: // UDP
+                    dohProviderLayout.setVisibility(View.GONE);
+                    transportAddrLayout.setVisibility(View.VISIBLE);
                     if (useAutoDns) {
                         transportAddr.setText("(auto-select best resolver)");
                         transportAddr.setEnabled(false);
@@ -196,6 +356,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                     }
                     break;
             }
+            saveSettings();
         });
     }
 
@@ -270,7 +431,12 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                 @Override
                 public void onResult(String resolver, boolean success, long latencyMs, String errorMsg) {
                     if (success) {
-                        handler.post(() -> appendLog("FOUND: " + resolver + " (" + latencyMs + "ms)"));
+                        handler.post(() -> {
+                            appendLog("FOUND: " + resolver + " (" + latencyMs + "ms)");
+                            // Store latency for display
+                            currentLatencyMs = latencyMs;
+                            latencyText.setText(latencyMs + " ms");
+                        });
                     } else {
                         // Only log failures occasionally to avoid spam
                         handler.post(() -> appendLog("Skip: " + resolver));
@@ -360,7 +526,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         }
 
         config.setMTU(1232);
-        config.setUTLSFingerprint("Chrome");
+        config.setUTLSFingerprint("none"); // Use standard TLS - uTLS causes errors on Android
         config.setUseZstd(true); // Enable zstd compression (server has it on by default)
         appendLog("Zstd compression: enabled");
 
@@ -455,28 +621,46 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
                 case 0: // Stopped
                     statusText.setText(R.string.status_disconnected);
                     statusText.setTextColor(getColor(R.color.disconnected));
+                    statusSubtext.setText("Tap connect to start");
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
                     connectButton.setText(R.string.connect);
-                    connectButton.setEnabled(true);  // Re-enable button
+                    connectButton.setEnabled(true);
                     isConnected = false;
                     setInputsEnabled(true);
+                    // Hide stats card
+                    statsCard.setVisibility(View.GONE);
+                    qualityText.setText("--");
+                    latencyText.setText("-- ms");
+                    speedText.setText("-- KB/s");
+                    lastBytesIn = 0;
+                    lastBytesOut = 0;
+                    lastUpdateTime = 0;
                     break;
                 case 1: // Connecting
                     statusText.setText(R.string.status_connecting);
                     statusText.setTextColor(getColor(R.color.connecting));
+                    statusSubtext.setText("Establishing connection...");
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_connecting);
                     connectButton.setText(R.string.disconnect);
                     isConnected = false;
                     break;
                 case 2: // Connected
                     statusText.setText(R.string.status_connected);
                     statusText.setTextColor(getColor(R.color.connected));
+                    statusSubtext.setText("Your traffic is protected");
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_connected);
                     connectButton.setText(R.string.disconnect);
                     isConnected = true;
+                    // Show stats card
+                    statsCard.setVisibility(View.VISIBLE);
                     break;
                 case 3: // Error
                     statusText.setText("Error");
                     statusText.setTextColor(getColor(R.color.disconnected));
+                    statusSubtext.setText("Connection failed");
+                    statusCircle.setBackgroundResource(R.drawable.status_circle_disconnected);
                     connectButton.setText(R.string.connect);
-                    connectButton.setEnabled(true);  // Re-enable button
+                    connectButton.setEnabled(true);
                     isConnected = false;
                     setInputsEnabled(true);
                     break;
@@ -489,7 +673,89 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         handler.post(() -> {
             bytesInText.setText(formatBytes(bytesIn));
             bytesOutText.setText(formatBytes(bytesOut));
+
+            // Calculate speed and update quality indicator
+            long currentTime = System.currentTimeMillis();
+            if (lastUpdateTime > 0 && isConnected) {
+                long timeDelta = currentTime - lastUpdateTime;
+                if (timeDelta > 0) {
+                    long bytesInDelta = bytesIn - lastBytesIn;
+                    long bytesOutDelta = bytesOut - lastBytesOut;
+                    long totalBytesDelta = bytesInDelta + bytesOutDelta;
+
+                    // Calculate speed in KB/s
+                    double speedKBps = (totalBytesDelta / 1024.0) / (timeDelta / 1000.0);
+                    speedText.setText(String.format("%.1f KB/s", speedKBps));
+
+                    // Estimate latency from response time (rough approximation)
+                    // If we have data transfer, estimate latency based on throughput
+                    if (totalBytesDelta > 0 && currentLatencyMs == 0) {
+                        // Rough estimate: latency = timeDelta / number of round trips
+                        // Assume ~1KB per DNS query/response
+                        long estimatedRoundTrips = Math.max(1, totalBytesDelta / 1024);
+                        currentLatencyMs = timeDelta / estimatedRoundTrips;
+                        if (currentLatencyMs > 0 && currentLatencyMs < 5000) {
+                            latencyText.setText(currentLatencyMs + " ms");
+                        }
+                    }
+
+                    // Update quality indicator based on speed
+                    updateConnectionQuality(speedKBps);
+                }
+
+                // Show quality bar when connected
+                if (qualityBarLayout.getVisibility() != View.VISIBLE) {
+                    qualityBarLayout.setVisibility(View.VISIBLE);
+                }
+            }
+
+            lastBytesIn = bytesIn;
+            lastBytesOut = bytesOut;
+            lastUpdateTime = currentTime;
         });
+    }
+
+    private void updateConnectionQuality(double speedKBps) {
+        // Quality score based on speed (0-100)
+        int qualityScore;
+        String qualityLabel;
+        int qualityColor;
+
+        if (speedKBps >= 100) {
+            qualityScore = 100;
+            qualityLabel = "Excellent";
+            qualityColor = Color.parseColor("#4CAF50"); // Green
+        } else if (speedKBps >= 50) {
+            qualityScore = 80;
+            qualityLabel = "Good";
+            qualityColor = Color.parseColor("#8BC34A"); // Light green
+        } else if (speedKBps >= 20) {
+            qualityScore = 60;
+            qualityLabel = "Fair";
+            qualityColor = Color.parseColor("#FFEB3B"); // Yellow
+        } else if (speedKBps >= 5) {
+            qualityScore = 40;
+            qualityLabel = "Poor";
+            qualityColor = Color.parseColor("#FF9800"); // Orange
+        } else if (speedKBps > 0) {
+            qualityScore = 20;
+            qualityLabel = "Very Poor";
+            qualityColor = Color.parseColor("#F44336"); // Red
+        } else {
+            qualityScore = 0;
+            qualityLabel = "No Data";
+            qualityColor = Color.parseColor("#9E9E9E"); // Gray
+        }
+
+        qualityText.setText(qualityLabel);
+        qualityText.setTextColor(qualityColor);
+        qualityBar.setProgress(qualityScore);
+        qualityBar.getProgressDrawable().setColorFilter(qualityColor, android.graphics.PorterDuff.Mode.SRC_IN);
+
+        // Update latency display (if we have latency data)
+        if (currentLatencyMs > 0) {
+            latencyText.setText(currentLatencyMs + " ms");
+        }
     }
 
     private String formatBytes(long bytes) {
@@ -503,6 +769,7 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
         prefs.edit()
                 .putString("transportType", transportType.getText().toString())
+                .putString("dohProvider", dohProvider.getText().toString())
                 .putString("transportAddr", getText(transportAddr))
                 .putString("domain", getText(domain))
                 .putString("pubkey", getText(pubkey))
@@ -516,10 +783,14 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     private void loadSettings() {
         SharedPreferences prefs = getSharedPreferences(PREFS_NAME, MODE_PRIVATE);
 
-        String type = prefs.getString("transportType", "UDP");
+        String type = prefs.getString("transportType", "DoH");
         transportType.setText(type, false);
 
-        transportAddr.setText(prefs.getString("transportAddr", "1.1.1.1:53"));
+        // Load DoH provider
+        String provider = prefs.getString("dohProvider", "Google");
+        dohProvider.setText(provider, false);
+
+        transportAddr.setText(prefs.getString("transportAddr", "https://dns.google/dns-query"));
         domain.setText(prefs.getString("domain", "t.example.com"));
         pubkey.setText(prefs.getString("pubkey", ""));
         tunnels.setText(prefs.getString("tunnels", "8"));
@@ -534,6 +805,9 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
         autoDnsSwitch.setChecked(useAutoDns);
         updateAutoDnsLabel();
 
+        // Update visibility based on transport type
+        updateDohProviderVisibility();
+
         // Disable transport address for UDP + Auto DNS mode
         if (useAutoDns && transportType.getText().toString().equalsIgnoreCase("UDP")) {
             transportAddr.setEnabled(false);
@@ -545,8 +819,82 @@ public class MainActivity extends AppCompatActivity implements StatusCallback {
     protected void onDestroy() {
         super.onDestroy();
         DnsttVpnService.setUiCallback(null);
+        if (appUpdater != null) {
+            appUpdater.cleanup();
+        }
         if (!vpnMode && isConnected) {
             client.stop();
         }
+    }
+
+    private void checkForUpdates() {
+        updateButton.setEnabled(false);
+        updateButton.setText("Checking...");
+        appendLog("Checking for updates...");
+
+        appUpdater.setCallback(new AppUpdater.UpdateCallback() {
+            @Override
+            public void onCheckStarted() {
+                // Already showing "Checking..."
+            }
+
+            @Override
+            public void onUpdateAvailable(String version, String releaseNotes, String downloadUrl) {
+                updateButton.setEnabled(true);
+                updateButton.setText("Update");
+                appendLog("Update available: v" + version);
+
+                new MaterialAlertDialogBuilder(MainActivity.this, R.style.ThemeOverlay_App_MaterialAlertDialog)
+                        .setTitle("Update Available")
+                        .setMessage("Version " + version + " is available.\n\n" + releaseNotes)
+                        .setPositiveButton("Download", (dialog, which) -> {
+                            appUpdater.downloadUpdate(downloadUrl, version);
+                        })
+                        .setNegativeButton("Later", null)
+                        .show();
+            }
+
+            @Override
+            public void onNoUpdate(String currentVersion) {
+                updateButton.setEnabled(true);
+                updateButton.setText("Check Update");
+                appendLog("App is up to date (v" + currentVersion + ")");
+
+                new MaterialAlertDialogBuilder(MainActivity.this, R.style.ThemeOverlay_App_MaterialAlertDialog)
+                        .setTitle("Up to Date")
+                        .setMessage("You're running the latest version (v" + currentVersion + ")")
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+
+            @Override
+            public void onError(String message) {
+                updateButton.setEnabled(true);
+                updateButton.setText("Check Update");
+                appendLog("Update check failed: " + message);
+
+                new MaterialAlertDialogBuilder(MainActivity.this, R.style.ThemeOverlay_App_MaterialAlertDialog)
+                        .setTitle("Update Check Failed")
+                        .setMessage("Could not check for updates:\n" + message)
+                        .setPositiveButton("OK", null)
+                        .show();
+            }
+
+            @Override
+            public void onDownloadStarted() {
+                appendLog("Downloading update...");
+                updateButton.setText("Downloading...");
+            }
+
+            @Override
+            public void onDownloadComplete(Uri apkUri) {
+                updateButton.setEnabled(true);
+                updateButton.setText("Check Update");
+                appendLog("Download complete, installing...");
+                appUpdater.installApk(apkUri);
+            }
+        });
+
+        appUpdater.checkForUpdates();
     }
 }
