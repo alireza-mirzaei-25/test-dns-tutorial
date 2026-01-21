@@ -127,7 +127,40 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
             try {
                 log("Starting DNSTT client...");
                 onStatusChange(1, "Establishing DNS tunnel...");
-                dnsttClient.start(config);
+
+                // Retry logic for port binding issues
+                int maxRetries = 3;
+                int retryDelay = 800; // ms
+                Exception lastException = null;
+
+                for (int attempt = 1; attempt <= maxRetries; attempt++) {
+                    try {
+                        dnsttClient.start(config);
+                        log("DNSTT client started successfully" + (attempt > 1 ? " (attempt " + attempt + ")" : ""));
+                        break; // Success, exit retry loop
+
+                    } catch (Exception e) {
+                        lastException = e;
+                        String errorMsg = e.getMessage();
+
+                        // Check if it's a port binding issue
+                        if (errorMsg != null && errorMsg.contains("bind") && errorMsg.contains("address already in use")) {
+                            if (attempt < maxRetries) {
+                                log("Port 1080 still in use, waiting " + retryDelay + "ms before retry " + attempt + "/" + (maxRetries - 1));
+                                onStatusChange(1, "Port busy, retrying in " + (retryDelay/1000.0) + "s...");
+                                Thread.sleep(retryDelay);
+                                // Exponential backoff: increase delay for next retry
+                                retryDelay = (int)(retryDelay * 1.5);
+                            } else {
+                                log("Failed to bind port after " + maxRetries + " attempts");
+                                throw e; // Out of retries, throw to outer catch
+                            }
+                        } else {
+                            // Different error, don't retry
+                            throw e;
+                        }
+                    }
+                }
 
                 log("DNSTT client started, waiting for connection...");
                 // Give DNSTT a moment to establish connection
@@ -361,6 +394,13 @@ public class DnsttVpnService extends VpnService implements StatusCallback {
             try {
                 dnsttClient.stop();
                 log("DNSTT client stopped");
+
+                // Give OS time to release port 1080 from TIME_WAIT state
+                // This prevents "address already in use" on quick reconnections
+                Thread.sleep(500);
+                log("Port cleanup delay completed");
+            } catch (InterruptedException e) {
+                log("Cleanup delay interrupted: " + e.getMessage());
             } catch (Exception e) {
                 log("Error stopping DNSTT client: " + e.getMessage());
             }
